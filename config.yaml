@@ -1,0 +1,95 @@
+# ============================================================
+# Discord Voice Bot Configuration
+# ============================================================
+# This file controls all bot settings. Edit values below and restart the bot.
+# For API keys and tokens, use the .env file instead (for security).
+# ============================================================
+
+# ------------------------------------------------------------
+# Wake Word Settings
+# ------------------------------------------------------------
+wake_word:
+  # The phrase that activates the bot
+  # Available built-in models:
+  #   - hey_jarvis    (recommended - works well)
+  #   - alexa         (Amazon Alexa wake word)
+  #   - hey_mycroft   (Mycroft assistant)
+  #   - timer         (detects "timer" keyword)
+  #   - weather       (detects "weather" keyword)
+  # You can also specify a path to a custom .onnx model file
+  phrase: "hey_jarvis"
+  
+  # Detection sensitivity (0.0 to 1.0)
+  # Lower = more sensitive (may have false positives)
+  # Higher = less sensitive (may miss some activations)
+  # Recommended: 0.5 for normal use, 0.3 for quiet environments
+  threshold: 0.5
+
+# ------------------------------------------------------------
+# Voice Settings (Gemini TTS)
+# ------------------------------------------------------------
+voice:
+  # The voice used for bot responses
+  # Available voices:
+  #   - Puck      (energetic, youthful)
+  #   - Charon    (deep, authoritative) 
+  #   - Kore      (warm, friendly)
+  #   - Fenrir    (bold, confident)
+  #   - Aoede     (melodic, expressive)
+  #   - Leda      (calm, soothing)
+  #   - Orus      (clear, professional)
+  #   - Zephyr    (light, airy)
+  name: "Puck"
+
+# ------------------------------------------------------------
+# Bot Behavior
+# ------------------------------------------------------------
+behavior:
+  # How long to capture speech after wake word (seconds)
+  # Increase if your questions get cut off
+  capture_duration: 5.0
+  
+  # Seconds of silence before ending capture
+  # Decrease for faster response, increase for longer pauses
+  silence_threshold: 0.5
+
+# ------------------------------------------------------------
+# System Prompt
+# ------------------------------------------------------------
+# This defines the bot's personality and behavior
+system_prompt: |
+  You are a helpful voice assistant in a Discord voice channel.
+  Keep your responses concise and conversational since they will be spoken aloud.
+  Be friendly, helpful, and natural in your responses.
+  If you don't understand something, ask for clarification.
+  Avoid using markdown formatting, bullet points, or numbered lists since this is voice output.
+
+# ------------------------------------------------------------
+# Audio Settings (Advanced)
+# ------------------------------------------------------------
+audio:
+  # Discord audio sample rate (don't change unless you know what you're doing)
+  discord_sample_rate: 48000
+  
+  # Gemini input sample rate (16kHz required by Gemini)
+  gemini_input_sample_rate: 16000
+  
+  # Gemini output sample rate (24kHz from Gemini TTS)
+  gemini_output_sample_rate: 24000
+
+# ------------------------------------------------------------
+# Logging Settings
+# ------------------------------------------------------------
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # DEBUG = verbose (good for troubleshooting)
+  # INFO = normal operation
+  level: "DEBUG"
+  
+  # Log directory (relative to bot root)
+  directory: "logs"
+  
+  # Log audio input (what the bot hears)
+  # When true, logs details about received audio for debugging
+  # Useful for troubleshooting wake word detection issues
+  log_audio: true

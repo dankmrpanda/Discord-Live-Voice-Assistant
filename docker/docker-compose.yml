@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: discord-live-vc-bot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount source for development (optional, comment out in production)
+      - ../src:/app/src:ro
+      # Mount config file for easy editing
+      - ../config.yaml:/app/config.yaml:ro
+      # Mount logs directory
+      - ../logs:/app/logs
+    networks:
+      - bot-network
+    # No ports needed - bot connects outbound to Discord
+    healthcheck:
+      test: ["CMD", "python", "-c", "import discord; print('healthy')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  bot-network:
+    driver: bridge

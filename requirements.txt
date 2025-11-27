@@ -1,0 +1,26 @@
+# Discord (using py-cord development version for voice fix)
+# See: https://github.com/Pycord-Development/pycord/issues/2833
+# The fix is in PR #2812, included in 2.7.0rc1+
+git+https://github.com/Pycord-Development/pycord.git@master#egg=py-cord[voice]
+PyNaCl>=1.5.0
+
+# Google Gemini
+google-genai>=0.8.0
+
+# Audio Processing
+numpy>=1.24.0
+scipy>=1.11.0
+librosa>=0.10.0
+soundfile>=0.12.0
+openwakeword>=0.6.0
+
+# Voice Activity Detection
+webrtcvad>=2.0.10
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+PyYAML>=6.0.0
+
+# Async
+asyncio-throttle>=1.0.2
