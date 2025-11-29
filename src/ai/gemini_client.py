@@ -137,9 +137,15 @@ class GeminiLiveClient:
         Returns:
             True if connection successful, False otherwise.
         """
-        if self._state != GeminiSessionState.DISCONNECTED:
+        if self._state not in (GeminiSessionState.DISCONNECTED, GeminiSessionState.ERROR):
             logger.warning(f"Cannot connect: state is {self._state}")
             return False
+        
+        # If in ERROR state, clean up first
+        if self._state == GeminiSessionState.ERROR:
+            logger.info("Reconnecting from ERROR state, cleaning up...")
+            self._session = None
+            self._session_manager = None
         
         try:
             from google.genai import types
@@ -214,20 +220,29 @@ class GeminiLiveClient:
             logger.warning(f"Cannot send audio: session={self._session is not None}, state={self._state}")
             return
         
+        # Validate audio data
+        if not audio_data or len(audio_data) == 0:
+            logger.debug("Skipping empty audio chunk")
+            return
+        
+        # Ensure audio data has even number of bytes (16-bit PCM = 2 bytes per sample)
+        if len(audio_data) % 2 != 0:
+            logger.warning(f"Audio data has odd number of bytes ({len(audio_data)}), trimming")
+            audio_data = audio_data[:-1]
+        
         try:
             from google.genai import types
             
             logger.debug(f"Sending audio: {len(audio_data)} bytes ({len(audio_data)/32000:.2f}s at 16kHz)")
             
-            # Encode audio as base64
-            audio_b64 = base64.b64encode(audio_data).decode("utf-8")
-            logger.debug(f"Base64 encoded: {len(audio_b64)} chars")
-            
-            # Send as realtime input
+            # Send as realtime input with raw bytes
+            # Note: types.Blob expects raw bytes, NOT base64-encoded string
+            # The library handles base64 encoding internally
+            # Using "audio/pcm" without rate parameter as per SDK tests
             await self._session.send_realtime_input(
                 audio=types.Blob(
-                    mime_type="audio/pcm;rate=16000",
-                    data=audio_b64,
+                    mime_type="audio/pcm",
+                    data=audio_data,  # Raw bytes, not base64
                 )
             )
             
@@ -301,7 +316,14 @@ class GeminiLiveClient:
             async for response in self._session.receive():
                 # Check for audio data
                 if response.data:
-                    audio_bytes = base64.b64decode(response.data)
+                    # Handle both raw bytes and base64-encoded responses
+                    # The google-genai SDK may return either depending on version
+                    if isinstance(response.data, bytes):
+                        audio_bytes = response.data
+                    else:
+                        # Assume base64-encoded string
+                        audio_bytes = base64.b64decode(response.data)
+                    
                     chunk_count += 1
                     total_bytes += len(audio_bytes)
                     self._audio_buffer.append(audio_bytes)
@@ -331,6 +353,8 @@ class GeminiLiveClient:
         except Exception as e:
             logger.error(f"Error receiving response: {e}")
             logger.debug(f"Receive error details: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             self._state = GeminiSessionState.ERROR
     
     async def get_full_audio_response(self) -> bytes:

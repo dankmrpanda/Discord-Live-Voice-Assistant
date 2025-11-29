@@ -99,6 +99,11 @@ class VoiceHandler:
         self._speech_buffer: list[bytes] = []
         self._capture_task: Optional[asyncio.Task] = None
         
+        # Real-time streaming state
+        self._is_capturing_for_gemini = False
+        self._capture_start_time: Optional[float] = None
+        self._audio_chunks_sent = 0
+        
         # Set up callbacks
         self._setup_callbacks()
         logger.debug("VoiceHandler initialization complete")
@@ -356,14 +361,14 @@ class VoiceHandler:
                         audio_bytes = self._processor.numpy_to_pcm(chunk)
                         
                         # Log audio details if enabled
-                        if self.log_audio:
-                            import numpy as np
-                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                            rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
-                            peak = np.max(np.abs(audio_array))
-                            logger.info(f"[AUDIO] Chunk {loop_count}: {len(audio_bytes)} bytes, RMS={rms:.0f}, Peak={peak}, samples={len(audio_array)}")
-                        elif loop_count % 100 == 0:  # Log occasionally when log_audio is off
-                            logger.debug(f"Processing audio chunk: {len(audio_bytes)} bytes")
+                        # if self.log_audio:
+                        #     import numpy as np
+                        #     audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                        #     rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
+                        #     peak = np.max(np.abs(audio_array))
+                        #     logger.debug(f"[AUDIO] Chunk {loop_count}: {len(audio_bytes)} bytes, RMS={rms:.0f}, Peak={peak}, samples={len(audio_array)}")
+                        # elif loop_count % 100 == 0:  # Log occasionally when log_audio is off
+                        #     logger.debug(f"Processing audio chunk: {len(audio_bytes)} bytes")
                         
                         await self._wake_detector.process_audio(audio_bytes)
                 
@@ -381,7 +386,7 @@ class VoiceHandler:
             logger.debug("Wake word detected but not in LISTENING state, ignoring")
             return
         
-        logger.info("Wake word detected! Starting speech capture...")
+        logger.info("🎤 Wake word detected! Starting real-time speech capture...")
         
         # Transition to processing state
         await self._set_state(BotState.PROCESSING)
@@ -389,98 +394,143 @@ class VoiceHandler:
         # Disable wake word detection during processing
         self._wake_detector.disable()
         
-        # Start capturing user speech
-        self._capture_task = asyncio.create_task(self._capture_user_speech())
+        # Clear any old buffer data
+        self._speech_buffer.clear()
+        self._capture.clear_buffer()
+        
+        # Start real-time streaming to Gemini
+        self._capture_task = asyncio.create_task(self._stream_audio_to_gemini())
     
-    async def _capture_user_speech(self) -> None:
-        """Capture user speech after wake word detection."""
+    async def _stream_audio_to_gemini(self) -> None:
+        """Stream audio in real-time to Gemini after wake word detection.
+        
+        This method captures audio and streams it to Gemini Live API in real-time,
+        then receives and plays the response audio immediately.
+        """
         try:
-            logger.debug(f"Starting speech capture for {self.capture_duration} seconds")
+            import time
+            
+            logger.info(f"🎙️ Starting real-time audio stream for {self.capture_duration} seconds")
+            
+            # Check if Gemini needs reconnection
+            if not self._gemini.is_connected:
+                logger.warning(f"Gemini not connected (state={self._gemini.state}), attempting reconnect...")
+                await self._gemini.disconnect()
+                if not await self._gemini.connect():
+                    logger.error("Failed to reconnect to Gemini")
+                    await self._reset_to_listening()
+                    return
+                logger.info("✓ Successfully reconnected to Gemini")
+            
+            # Initialize capture state
+            self._is_capturing_for_gemini = True
+            self._capture_start_time = time.time()
+            self._audio_chunks_sent = 0
             self._speech_buffer.clear()
             
-            # Capture audio for the specified duration
-            # In a real implementation, use VAD for smarter end-of-speech detection
-            capture_start = asyncio.get_event_loop().time()
-            chunks_captured = 0
+            # Stream audio in small chunks for low latency
+            capture_start = time.time()
+            chunk_interval = 0.05  # 50ms interval for responsive streaming
+            total_audio_bytes = 0
             
-            while (asyncio.get_event_loop().time() - capture_start) < self.capture_duration:
-                # Get recent audio
-                chunk = await self._capture.get_chunk_for_wake_word()
-                if chunk is not None:
+            logger.debug("📤 Starting to stream audio chunks to Gemini...")
+            
+            while (time.time() - capture_start) < self.capture_duration:
+                # Get and consume the latest audio chunk (avoids re-sending same audio)
+                chunk = await self._capture.get_and_consume_chunk()
+                
+                if chunk is not None and len(chunk) > 0:
                     audio_bytes = self._processor.numpy_to_pcm(chunk)
-                    self._speech_buffer.append(audio_bytes)
-                    chunks_captured += 1
-                    if chunks_captured % 10 == 0:
-                        elapsed = asyncio.get_event_loop().time() - capture_start
-                        logger.debug(f"Capturing speech: {chunks_captured} chunks, {elapsed:.1f}s elapsed")
+                    
+                    # Only send if we have valid audio data
+                    if audio_bytes and len(audio_bytes) > 0:
+                        self._speech_buffer.append(audio_bytes)
+                        total_audio_bytes += len(audio_bytes)
+                        self._audio_chunks_sent += 1
+                        
+                        # Send audio to Gemini in real-time
+                        await self._gemini.send_audio(audio_bytes)
+                    
+                    # Log progress periodically
+                    if self._audio_chunks_sent % 10 == 0:
+                        elapsed = time.time() - capture_start
+                        logger.debug(f"📤 Streamed {self._audio_chunks_sent} chunks ({total_audio_bytes} bytes, {elapsed:.1f}s)")
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(chunk_interval)
             
-            # Combine captured audio
-            logger.debug(f"Speech capture complete: {chunks_captured} total chunks")
-            if self._speech_buffer:
-                full_audio = b"".join(self._speech_buffer)
-                logger.info(f"Captured {len(full_audio)} bytes of speech ({len(full_audio)/32000:.2f}s at 16kHz)")
-                
-                # Send to Gemini and get response
-                await self._process_with_gemini(full_audio)
+            # End of capture
+            self._is_capturing_for_gemini = False
+            elapsed = time.time() - capture_start
+            
+            logger.info(f"✓ Capture complete: {self._audio_chunks_sent} chunks, {total_audio_bytes} bytes in {elapsed:.2f}s")
+            
+            if total_audio_bytes > 0:
+                # Signal end of turn and get response
+                await self._get_gemini_response_and_play()
             else:
-                logger.warning("No speech captured after wake word")
+                logger.warning("⚠️ No audio captured after wake word")
                 await self._reset_to_listening()
                 
         except asyncio.CancelledError:
-            logger.debug("Speech capture cancelled")
+            logger.debug("Audio streaming cancelled")
+            self._is_capturing_for_gemini = False
         except Exception as e:
-            logger.error(f"Error capturing speech: {e}")
+            logger.error(f"❌ Error streaming audio to Gemini: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            self._is_capturing_for_gemini = False
             await self._reset_to_listening()
     
-    async def _process_with_gemini(self, audio_data: bytes) -> None:
-        """Process captured audio with Gemini and play response.
-        
-        Args:
-            audio_data: Captured speech audio (16kHz mono PCM).
-        """
+    async def _get_gemini_response_and_play(self) -> None:
+        """Request response from Gemini and play audio in real-time."""
         try:
-            logger.info(f"Sending {len(audio_data)} bytes of audio to Gemini...")
-            logger.debug(f"Audio duration: {len(audio_data)/32000:.2f}s at 16kHz")
-            
-            # Send audio to Gemini
             import time
-            send_start = time.time()
-            await self._gemini.send_audio(audio_data)
-            logger.debug(f"Audio sent to Gemini in {time.time() - send_start:.3f}s")
             
-            # Request response
-            logger.debug("Requesting response from Gemini (end_turn)")
+            logger.info("📨 Requesting response from Gemini...")
+            
+            # Signal end of user input
             await self._gemini.end_turn()
             
             # Transition to speaking state
             await self._set_state(BotState.SPEAKING)
             
-            # Collect and play response
-            logger.debug("Waiting for Gemini audio response...")
+            # Collect and play response in real-time
+            logger.debug("🔊 Waiting for Gemini audio response...")
             response_start = time.time()
             response_audio = await self._gemini.get_full_audio_response()
-            logger.debug(f"Received response in {time.time() - response_start:.3f}s")
+            response_time = time.time() - response_start
             
             if response_audio:
-                logger.info(f"Playing {len(response_audio)} bytes of response audio ({len(response_audio)/48000:.2f}s at 24kHz)")
+                audio_duration = len(response_audio) / 48000  # Approximate duration at 24kHz (will be converted to 48kHz)
+                logger.info(f"🔊 Playing response: {len(response_audio)} bytes (~{audio_duration:.1f}s) received in {response_time:.2f}s")
+                
                 await self._playback.play_gemini_audio(response_audio)
                 
                 # Wait for playback to complete
                 await self._playback.wait_for_playback(timeout=60.0)
+                logger.info("✓ Playback complete")
             else:
-                logger.warning("No audio response from Gemini")
-                await self._reset_to_listening()
+                logger.warning("⚠️ No audio response from Gemini")
+            
+            await self._reset_to_listening()
                 
         except Exception as e:
-            logger.error(f"Error processing with Gemini: {e}")
+            logger.error(f"❌ Error getting Gemini response: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             await self._reset_to_listening()
     
+    async def _capture_user_speech(self) -> None:
+        """Legacy method - now redirects to streaming approach."""
+        await self._stream_audio_to_gemini()
+    
     def _on_playback_complete_sync(self) -> None:
-        """Synchronous callback when playback completes."""
-        # Schedule the async reset
-        asyncio.create_task(self._reset_to_listening())
+        """Synchronous callback when playback completes.
+        
+        Note: This is called by Discord's audio system. We don't reset to listening
+        here since _get_gemini_response_and_play handles that explicitly.
+        """
+        logger.debug("Playback complete callback triggered")
     
     async def _reset_to_listening(self) -> None:
         """Reset to listening state after processing/speaking."""

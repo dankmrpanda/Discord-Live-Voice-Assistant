@@ -144,13 +144,13 @@ class WakeWordDetector:
         self._last_scores = prediction
         
         # Log scores - verbose logs every chunk, otherwise every ~5 seconds
-        log_interval = 1 if self.verbose else 50
-        if self._process_count % log_interval == 0:
-            scores_str = ", ".join([f"{k}={v:.3f}" for k, v in prediction.items()])
-            if self.verbose:
-                logger.info(f"[WAKE] Scores: {scores_str}")
-            else:
-                logger.debug(f"Wake word scores (chunk #{self._process_count}): {scores_str}")
+        # log_interval = 1 if self.verbose else 50
+        # if self._process_count % log_interval == 0:
+        #     scores_str = ", ".join([f"{k}={v:.3f}" for k, v in prediction.items()])
+        #     if self.verbose:
+        #         logger.debug(f"[WAKE] Scores: {scores_str}")
+        #     else:
+        #         logger.debug(f"Wake word scores (chunk #{self._process_count}): {scores_str}")
         
         # Check if any model detected wake word above threshold
         detected = False

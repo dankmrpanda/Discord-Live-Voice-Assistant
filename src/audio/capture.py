@@ -156,6 +156,28 @@ class AudioCapture:
             # Return the most recent chunk
             return all_samples[-self._samples_per_chunk:]
     
+    async def get_and_consume_chunk(self) -> Optional[np.ndarray]:
+        """Get all accumulated audio and clear buffer (for streaming to Gemini).
+        
+        This returns all audio accumulated since the last call and clears the buffer,
+        preventing re-sending the same audio data during real-time streaming.
+        
+        Returns:
+            Numpy array of all accumulated audio samples, or None if buffer is empty.
+        """
+        async with self._lock:
+            if self._buffer_samples == 0:
+                return None
+            
+            # Collect all samples in buffer
+            all_samples = np.concatenate(list(self._buffer))
+            
+            # Clear the buffer after consuming
+            self._buffer.clear()
+            self._buffer_samples = 0
+            
+            return all_samples
+    
     def clear_buffer(self) -> None:
         """Clear the audio buffer synchronously."""
         self._buffer.clear()
