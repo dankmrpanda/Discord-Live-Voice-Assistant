@@ -26,14 +26,15 @@ class GeminiLiveClient:
     providing low-latency speech-to-speech interaction.
     """
     
-    # Gemini Live API model for native audio
-    MODEL = "gemini-2.0-flash-live-001"
+    # Default Gemini Live API model
+    DEFAULT_MODEL = "gemini-2.0-flash-live-001"
     
     def __init__(
         self,
         api_key: str,
         voice: str = "Puck",
         system_instruction: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize the Gemini Live API client.
         
@@ -41,8 +42,10 @@ class GeminiLiveClient:
             api_key: Google Gemini API key.
             voice: Voice to use for TTS (Puck, Charon, Kore, etc.).
             system_instruction: Optional system prompt for the model.
+            model: Gemini model to use (defaults to gemini-2.0-flash-live-001).
         """
-        logger.debug(f"Initializing GeminiLiveClient with voice={voice}, model={self.MODEL}")
+        self.model = model or self.DEFAULT_MODEL
+        logger.debug(f"Initializing GeminiLiveClient with voice={voice}, model={self.model}")
         
         self.api_key = api_key
         self.voice = voice
@@ -81,7 +84,7 @@ class GeminiLiveClient:
             
             logger.debug("Creating Gemini client with API key")
             self._client = genai.Client(api_key=self.api_key)
-            logger.info(f"Gemini client initialized successfully (model: {self.MODEL})")
+            logger.info(f"Gemini client initialized successfully (model: {self.model})")
             
         except ImportError as e:
             logger.error(f"Failed to import google-genai: {e}")
@@ -153,7 +156,7 @@ class GeminiLiveClient:
             
             self._state = GeminiSessionState.CONNECTING
             logger.info("Connecting to Gemini Live API...")
-            logger.debug(f"Model: {self.MODEL}, Voice: {self.voice}")
+            logger.debug(f"Model: {self.model}, Voice: {self.voice}")
             
             # Configure the session
             logger.debug("Creating LiveConnectConfig")
@@ -177,7 +180,7 @@ class GeminiLiveClient:
             logger.debug("Establishing WebSocket connection...")
             connect_start = time.time()
             self._session_manager = self._client.aio.live.connect(
-                model=self.MODEL,
+                model=self.model,
                 config=config,
             )
             self._session = await self._session_manager.__aenter__()
@@ -207,6 +210,9 @@ class GeminiLiveClient:
         self._audio_buffer.clear()
         logger.info("Disconnected from Gemini Live API")
     
+    # Minimum audio chunk size (at least 100ms of audio at 16kHz, 16-bit = 3200 bytes)
+    MIN_AUDIO_CHUNK_SIZE = 320  # ~10ms minimum to avoid tiny fragments
+    
     async def send_audio(self, audio_data: bytes) -> None:
         """Send audio data to Gemini.
         
@@ -230,6 +236,11 @@ class GeminiLiveClient:
             logger.warning(f"Audio data has odd number of bytes ({len(audio_data)}), trimming")
             audio_data = audio_data[:-1]
         
+        # Skip very small chunks that might cause invalid argument errors
+        if len(audio_data) < self.MIN_AUDIO_CHUNK_SIZE:
+            logger.debug(f"Skipping small audio chunk ({len(audio_data)} bytes < {self.MIN_AUDIO_CHUNK_SIZE})")
+            return
+        
         try:
             from google.genai import types
             
@@ -238,10 +249,10 @@ class GeminiLiveClient:
             # Send as realtime input with raw bytes
             # Note: types.Blob expects raw bytes, NOT base64-encoded string
             # The library handles base64 encoding internally
-            # Using "audio/pcm" without rate parameter as per SDK tests
+            # IMPORTANT: Include sample rate in MIME type as per Gemini Live API docs
             await self._session.send_realtime_input(
                 audio=types.Blob(
-                    mime_type="audio/pcm",
+                    mime_type="audio/pcm;rate=16000",
                     data=audio_data,  # Raw bytes, not base64
                 )
             )
@@ -351,10 +362,17 @@ class GeminiLiveClient:
                     break
                     
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"Error receiving response: {e}")
             logger.debug(f"Receive error details: {type(e).__name__}: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+            
+            # Mark session as error so it will reconnect on next request
+            # Common error: "1007 (invalid frame payload data) Request contains an invalid argument"
+            # This typically happens when audio format is incorrect or connection is stale
+            if "1007" in error_msg or "invalid" in error_msg.lower():
+                logger.warning("WebSocket error detected, marking session for reconnection")
             self._state = GeminiSessionState.ERROR
     
     async def get_full_audio_response(self) -> bytes:

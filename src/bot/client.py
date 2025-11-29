@@ -5,7 +5,7 @@ from discord.ext import commands
 from typing import Optional
 
 from ..utils.logger import get_logger
-from ..utils.config import Config
+from ..utils.config import Config, ConfigWatcher
 from .voice_handler import VoiceHandler, BotState
 
 logger = get_logger("bot.client")
@@ -38,6 +38,7 @@ class DiscordBot(commands.Bot):
         self.config = config
         self._voice_handlers: dict[int, VoiceHandler] = {}  # guild_id -> handler
         self._joining_guilds: set[int] = set()  # guilds currently in join process
+        self._config_watcher: Optional[ConfigWatcher] = None
         logger.debug("DiscordBot initialization complete")
         
         # Register slash commands
@@ -105,6 +106,12 @@ class DiscordBot(commands.Bot):
         for guild in self.guilds:
             logger.debug(f"  - {guild.name} (ID: {guild.id}, Members: {guild.member_count})")
         logger.info("=" * 40)
+        
+        # Start config file watcher
+        if self._config_watcher is None:
+            self._config_watcher = ConfigWatcher(self.config, check_interval=2.0)
+            await self._config_watcher.start()
+            logger.info("📝 Config file watcher started (changes auto-reload)")
     
     async def on_voice_state_update(
         self,
@@ -226,6 +233,26 @@ class DiscordBot(commands.Bot):
         logger.info(f"Left voice channel in guild {guild_id}")
         
         return True, "Left the voice channel. Goodbye!"
+    
+    async def close(self) -> None:
+        """Clean up resources when bot is closing."""
+        logger.info("Bot closing, cleaning up resources...")
+        
+        # Stop config watcher
+        if self._config_watcher:
+            await self._config_watcher.stop()
+            logger.debug("Config watcher stopped")
+        
+        # Leave all voice channels
+        for guild_id in list(self._voice_handlers.keys()):
+            try:
+                await self.leave_voice(guild_id)
+            except Exception as e:
+                logger.debug(f"Error leaving voice in guild {guild_id}: {e}")
+        
+        # Call parent close
+        await super().close()
+        logger.info("Bot cleanup complete")
 
 
 # Global bot reference (kept for compatibility)

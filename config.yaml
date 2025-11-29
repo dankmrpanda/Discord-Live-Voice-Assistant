@@ -39,7 +39,23 @@ voice:
   #   - Leda      (calm, soothing)
   #   - Orus      (clear, professional)
   #   - Zephyr    (light, airy)
-  name: "Puck"
+  #   - Sulafat   (warm, confident, persuasive)
+  #   - Despina   (warm, inviting, smooth)
+  #   - Vindemiatrix (calm, mature, reassuring)
+  name: "Sulafat"
+
+# ------------------------------------------------------------
+# Gemini Model Settings
+# ------------------------------------------------------------
+gemini:
+  # The Gemini model to use for voice interactions
+  # Available Live API models:
+  #   - gemini-2.0-flash-live-001                     (stable, fast, voices: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, Zephyr)
+  #   - gemini-2.5-flash-native-audio-preview-09-2025 (preview, more voices including Sulafat, Despina, Vindemiatrix)
+  # Note: Some voices are only available on certain models!
+  #   - For Sulafat, Despina, Vindemiatrix: use gemini-2.5-flash-native-audio-preview-09-2025
+  #   - For Puck, Charon, Kore, etc: use gemini-2.0-flash-live-001
+  model: "gemini-2.5-flash-native-audio-preview-09-2025"
 
 # ------------------------------------------------------------
 # Bot Behavior

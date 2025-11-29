@@ -93,6 +93,7 @@ class VoiceHandler:
             api_key=config.gemini_api_key,
             voice=config.gemini_voice,
             system_instruction=getattr(config, 'system_prompt', None),
+            model=config.gemini_model,
         )
         
         # Audio buffer for post-wake word capture
@@ -109,7 +110,85 @@ class VoiceHandler:
         
         # Set up callbacks
         self._setup_callbacks()
+        
+        # Register for config changes
+        self.config.add_change_listener(self._on_config_changed)
+        
         logger.debug("VoiceHandler initialization complete")
+    
+    def _on_config_changed(self, config: "Config", changed_fields: list) -> None:
+        """Handle configuration changes.
+        
+        Args:
+            config: The updated config object.
+            changed_fields: List of field names that changed.
+        """
+        logger.info(f"🔄 Config changed: {', '.join(changed_fields)}")
+        
+        # Update local cached values
+        if "capture_duration" in changed_fields:
+            self.capture_duration = config.capture_duration
+            logger.info(f"  → Capture duration: {self.capture_duration}s")
+        
+        if "silence_threshold" in changed_fields:
+            self.silence_threshold = config.silence_threshold
+            logger.info(f"  → Silence threshold: {self.silence_threshold}s")
+        
+        if "log_audio" in changed_fields:
+            self.log_audio = config.log_audio
+            self._wake_detector.verbose = config.log_audio
+            logger.info(f"  → Log audio: {self.log_audio}")
+        
+        # Update wake word detector
+        if "wake_phrase" in changed_fields or "wake_word_threshold" in changed_fields:
+            logger.info(f"  → Wake phrase: '{config.wake_phrase_display}' (threshold: {config.wake_word_threshold})")
+            # Recreate wake word detector with new settings
+            self._wake_detector = WakeWordDetector(
+                wake_phrase=config.wake_phrase,
+                threshold=config.wake_word_threshold,
+                sample_rate=config.gemini_input_sample_rate,
+                verbose=self.log_audio,
+            )
+            self._wake_detector.set_detection_callback(self._on_wake_word_detected)
+            logger.info("  → Wake word detector recreated")
+        
+        # Update Gemini client if voice, model, or system prompt changed
+        if "gemini_voice" in changed_fields or "gemini_model" in changed_fields or "system_prompt" in changed_fields:
+            if "gemini_voice" in changed_fields:
+                logger.info(f"  → Gemini voice: {config.gemini_voice}")
+            if "gemini_model" in changed_fields:
+                logger.info(f"  → Gemini model: {config.gemini_model}")
+            # Need to reconnect Gemini with new settings
+            asyncio.create_task(self._reconnect_gemini_with_new_config())
+    
+    async def _reconnect_gemini_with_new_config(self) -> None:
+        """Reconnect to Gemini with updated configuration."""
+        try:
+            logger.info("🔄 Reconnecting to Gemini with new config...")
+            
+            # Disconnect existing session
+            if self._gemini.is_connected:
+                await self._gemini.disconnect()
+            
+            # Create new client with updated settings
+            self._gemini = GeminiLiveClient(
+                api_key=self.config.gemini_api_key,
+                voice=self.config.gemini_voice,
+                system_instruction=getattr(self.config, 'system_prompt', None),
+                model=self.config.gemini_model,
+            )
+            
+            # Reconnect if we're in a voice channel
+            if self._state != BotState.IDLE:
+                if await self._gemini.connect():
+                    logger.info("✓ Reconnected to Gemini with new settings")
+                else:
+                    logger.error("Failed to reconnect to Gemini")
+            else:
+                logger.info("✓ Gemini client updated (will connect when joining voice)")
+                
+        except Exception as e:
+            logger.error(f"Error reconnecting Gemini: {e}")
     
     def _setup_callbacks(self) -> None:
         """Set up callbacks between components."""
@@ -499,8 +578,19 @@ class VoiceHandler:
         """Request response from Gemini and play audio in real-time."""
         try:
             import time
+            from ..ai.gemini_client import GeminiSessionState
             
             logger.info("📨 Requesting response from Gemini...")
+            
+            # Check if Gemini is in error state and needs reconnection
+            if self._gemini.state == GeminiSessionState.ERROR:
+                logger.warning("Gemini in error state, attempting reconnection before response...")
+                await self._gemini.disconnect()
+                if not await self._gemini.connect():
+                    logger.error("Failed to reconnect to Gemini after error")
+                    await self._reset_to_listening()
+                    return
+                logger.info("✓ Reconnected to Gemini after error state")
             
             # Signal end of user input
             await self._gemini.end_turn()

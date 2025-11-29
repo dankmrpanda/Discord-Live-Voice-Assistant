@@ -5,7 +5,7 @@ import sys
 import platform
 from pathlib import Path
 
-from .utils.config import Config
+from .utils.config import Config, ConfigWatcher
 from .utils.logger import setup_logger, get_logger
 from .bot.client import DiscordBot, set_bot
 
@@ -32,6 +32,12 @@ def main() -> int:
         enable_debug_file=True,
     )
     
+    # Add config change listener for logging
+    def log_config_change(cfg: Config, changed: list) -> None:
+        logger.info(f"📝 Configuration reloaded: {', '.join(changed)}")
+    
+    config.add_change_listener(log_config_change)
+    
     logger.info("=" * 60)
     logger.info("Discord Live VC Bot Starting")
     logger.info("=" * 60)
@@ -51,6 +57,7 @@ def main() -> int:
     # Log configuration
     logger.info(f"Wake phrase: '{config.wake_phrase_display}'")
     logger.info(f"Wake word threshold: {config.wake_word_threshold}")
+    logger.info(f"Gemini model: {config.gemini_model}")
     logger.info(f"Gemini voice: {config.gemini_voice}")
     logger.info(f"Capture duration: {config.capture_duration}s")
     logger.info(f"Log level: {config.log_level}")
