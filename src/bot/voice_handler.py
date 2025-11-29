@@ -99,6 +99,9 @@ class VoiceHandler:
         self._speech_buffer: list[bytes] = []
         self._capture_task: Optional[asyncio.Task] = None
         
+        # Track which user triggered wake word
+        self._triggered_user_id: Optional[int] = None
+        
         # Real-time streaming state
         self._is_capturing_for_gemini = False
         self._capture_start_time: Optional[float] = None
@@ -110,11 +113,28 @@ class VoiceHandler:
     
     def _setup_callbacks(self) -> None:
         """Set up callbacks between components."""
-        # Wake word detection callback
+        # Wake word detection callback (now receives user_id)
         self._wake_detector.set_detection_callback(self._on_wake_word_detected)
         
         # Playback completion callback
         self._playback.set_after_callback(self._on_playback_complete_sync)
+        
+        # Audio capture callback (receives audio and user_id)
+        self._capture.set_audio_callback(self._on_audio_chunk_received)
+    
+    async def _on_audio_chunk_received(self, audio_data: bytes, user_id: int) -> None:
+        """Callback when audio chunk is received from a user.
+        
+        This is called for each processed audio chunk and handles per-user
+        wake word detection.
+        
+        Args:
+            audio_data: PCM audio bytes (16kHz, mono).
+            user_id: Discord user ID this audio came from.
+        """
+        if self._state == BotState.LISTENING and user_id != 0:
+            # Process wake word detection for this specific user
+            await self._wake_detector.process_audio_for_user(audio_data, user_id)
     
     async def _on_recording_finished(self, sink, channel, *args) -> None:
         """Handle recording finished event.
@@ -337,13 +357,9 @@ class VoiceHandler:
     async def _audio_receive_loop(self) -> None:
         """Main loop for receiving and processing audio from Discord.
         
-        Note: Discord's voice receive is limited. This implementation
-        uses a sink approach where available.
+        This loop monitors connection state and performs periodic housekeeping.
+        Wake word detection is now handled per-user in _on_audio_chunk_received.
         """
-        # Discord.py voice receive is complex and somewhat undocumented
-        # For now, we'll use a polling approach with the voice client
-        # In production, consider using discord.py's listen() or a sink
-        
         logger.debug("Audio receive loop started")
         loop_count = 0
         
@@ -351,26 +367,13 @@ class VoiceHandler:
             try:
                 loop_count += 1
                 if loop_count % 200 == 0:  # Log every 10 seconds (200 * 50ms)
-                    logger.debug(f"Audio loop heartbeat: state={self._state.value}, loops={loop_count}")
+                    active_users = self._capture.get_active_users()
+                    detector_users = self._wake_detector.get_active_users()
+                    logger.debug(f"Audio loop heartbeat: state={self._state.value}, loops={loop_count}, "
+                                f"capture_users={len(active_users)}, detector_users={len(detector_users)}")
                 
-                # Check if we should process audio
-                if self._state == BotState.LISTENING:
-                    # Get audio chunk for wake word detection
-                    chunk = await self._capture.get_chunk_for_wake_word()
-                    if chunk is not None:
-                        audio_bytes = self._processor.numpy_to_pcm(chunk)
-                        
-                        # Log audio details if enabled
-                        # if self.log_audio:
-                        #     import numpy as np
-                        #     audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                        #     rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
-                        #     peak = np.max(np.abs(audio_array))
-                        #     logger.debug(f"[AUDIO] Chunk {loop_count}: {len(audio_bytes)} bytes, RMS={rms:.0f}, Peak={peak}, samples={len(audio_array)}")
-                        # elif loop_count % 100 == 0:  # Log occasionally when log_audio is off
-                        #     logger.debug(f"Processing audio chunk: {len(audio_bytes)} bytes")
-                        
-                        await self._wake_detector.process_audio(audio_bytes)
+                # Note: Wake word detection is now handled in _on_audio_chunk_received
+                # which is called per-user when audio is processed
                 
                 await asyncio.sleep(0.05)  # 50ms polling interval
                 
@@ -380,13 +383,24 @@ class VoiceHandler:
                 logger.error(f"Error in audio receive loop: {e}")
                 await asyncio.sleep(0.1)
     
-    async def _on_wake_word_detected(self) -> None:
-        """Handle wake word detection."""
+    async def _on_wake_word_detected(self, user_id: int) -> None:
+        """Handle wake word detection from a specific user.
+        
+        Args:
+            user_id: Discord user ID who triggered the wake word.
+        """
         if self._state != BotState.LISTENING:
             logger.debug("Wake word detected but not in LISTENING state, ignoring")
             return
         
-        logger.info("🎤 Wake word detected! Starting real-time speech capture...")
+        logger.info(f"🎤 Wake word detected from user {user_id}! Starting real-time speech capture...")
+        
+        # Store which user triggered the wake word
+        self._triggered_user_id = user_id
+        
+        # Set this user as the active user for audio capture
+        # This means only their audio will be captured for the prompt
+        self._capture.set_active_user(user_id)
         
         # Transition to processing state
         await self._set_state(BotState.PROCESSING)
@@ -394,9 +408,9 @@ class VoiceHandler:
         # Disable wake word detection during processing
         self._wake_detector.disable()
         
-        # Clear any old buffer data
+        # Clear any old buffer data (but keep user-specific buffer for their speech)
         self._speech_buffer.clear()
-        self._capture.clear_buffer()
+        self._capture.clear_buffer()  # Clear shared buffer, user buffer preserved
         
         # Start real-time streaming to Gemini
         self._capture_task = asyncio.create_task(self._stream_audio_to_gemini())
@@ -536,6 +550,10 @@ class VoiceHandler:
         """Reset to listening state after processing/speaking."""
         if self._state == BotState.IDLE:
             return
+        
+        # Clear triggered user tracking
+        self._triggered_user_id = None
+        self._capture.set_active_user(None)
         
         # Clear buffers
         self._speech_buffer.clear()

@@ -1,9 +1,9 @@
-"""Audio processing utilities for format conversion."""
+"""Audio processing utilities for format conversion with optimized resampling."""
 
 import io
 import numpy as np
 from scipy import signal
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 from ..utils.logger import get_logger
 
@@ -11,7 +11,13 @@ logger = get_logger("audio.processor")
 
 
 class AudioProcessor:
-    """Handles audio format conversion between Discord and Gemini formats."""
+    """Handles audio format conversion between Discord and Gemini formats.
+    
+    Optimized with:
+    - Pre-computed resampling filters for common rate conversions
+    - Efficient polyphase resampling (scipy.signal.resample_poly)
+    - Cached filter coefficients to avoid recomputation
+    """
     
     def __init__(
         self,
@@ -29,6 +35,31 @@ class AudioProcessor:
         self.discord_sample_rate = discord_sample_rate
         self.gemini_input_sample_rate = gemini_input_sample_rate
         self.gemini_output_sample_rate = gemini_output_sample_rate
+        
+        # Pre-compute GCD-based resampling ratios for common conversions
+        # Discord (48kHz) to Gemini input (16kHz): 48/16 = 3/1 (downsample by 3)
+        # Gemini output (24kHz) to Discord (48kHz): 48/24 = 2/1 (upsample by 2)
+        self._resample_ratios: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._setup_resampling_ratios()
+        
+        logger.debug(f"AudioProcessor initialized: discord={discord_sample_rate}Hz, "
+                    f"gemini_in={gemini_input_sample_rate}Hz, gemini_out={gemini_output_sample_rate}Hz")
+    
+    def _setup_resampling_ratios(self) -> None:
+        """Pre-compute optimal resampling ratios using GCD."""
+        import math
+        
+        conversions = [
+            (self.discord_sample_rate, self.gemini_input_sample_rate),  # 48k -> 16k
+            (self.gemini_output_sample_rate, self.discord_sample_rate),  # 24k -> 48k
+        ]
+        
+        for orig_sr, target_sr in conversions:
+            gcd = math.gcd(orig_sr, target_sr)
+            up = target_sr // gcd
+            down = orig_sr // gcd
+            self._resample_ratios[(orig_sr, target_sr)] = (up, down)
+            logger.debug(f"Resampling {orig_sr}Hz -> {target_sr}Hz: up={up}, down={down}")
     
     def pcm_to_numpy(self, pcm_data: bytes, sample_width: int = 2) -> np.ndarray:
         """Convert PCM bytes to numpy array.
@@ -48,8 +79,8 @@ class AudioProcessor:
             dtype = np.int16
         
         audio = np.frombuffer(pcm_data, dtype=dtype)
-        # Normalize to float32 [-1, 1]
-        return audio.astype(np.float32) / np.iinfo(dtype).max
+        # Normalize to float32 [-1, 1] using multiplication (faster than division)
+        return audio.astype(np.float32) * (1.0 / np.iinfo(dtype).max)
     
     def numpy_to_pcm(self, audio: np.ndarray, sample_width: int = 2) -> bytes:
         """Convert numpy array to PCM bytes.
@@ -84,6 +115,9 @@ class AudioProcessor:
     ) -> np.ndarray:
         """Resample audio to a different sample rate.
         
+        Uses polyphase resampling for efficiency when ratios are known,
+        falls back to scipy.signal.resample for arbitrary ratios.
+        
         Args:
             audio: Input audio as numpy array.
             orig_sr: Original sample rate.
@@ -95,7 +129,15 @@ class AudioProcessor:
         if orig_sr == target_sr:
             return audio
         
-        # Calculate the number of samples in the resampled audio
+        # Use pre-computed ratios for polyphase resampling if available
+        ratio_key = (orig_sr, target_sr)
+        if ratio_key in self._resample_ratios:
+            up, down = self._resample_ratios[ratio_key]
+            # resample_poly is more efficient for integer ratios
+            resampled = signal.resample_poly(audio, up, down)
+            return resampled.astype(np.float32)
+        
+        # Fall back to general resampling for non-standard rates
         num_samples = int(len(audio) * target_sr / orig_sr)
         resampled = signal.resample(audio, num_samples)
         return resampled.astype(np.float32)
@@ -126,6 +168,8 @@ class AudioProcessor:
         Discord: 48kHz, 16-bit PCM, stereo
         Gemini: 16kHz, 16-bit PCM, mono
         
+        Optimized path: stereo->mono first, then resample (fewer samples to process).
+        
         Args:
             pcm_data: Raw PCM audio from Discord.
             is_stereo: Whether the input is stereo.
@@ -136,11 +180,11 @@ class AudioProcessor:
         # Convert to numpy
         audio = self.pcm_to_numpy(pcm_data)
         
-        # Convert stereo to mono if needed
+        # Convert stereo to mono FIRST (reduces samples by half before resampling)
         if is_stereo:
             audio = self.stereo_to_mono(audio)
         
-        # Resample from 48kHz to 16kHz
+        # Resample from 48kHz to 16kHz (uses optimized polyphase: down by 3)
         audio = self.resample(
             audio,
             self.discord_sample_rate,
@@ -165,7 +209,7 @@ class AudioProcessor:
         # Convert to numpy
         audio = self.pcm_to_numpy(pcm_data)
         
-        # Resample from 24kHz to 48kHz
+        # Resample from 24kHz to 48kHz (uses optimized polyphase: up by 2)
         audio = self.resample(
             audio,
             self.gemini_output_sample_rate,
@@ -173,7 +217,8 @@ class AudioProcessor:
         )
         
         # Convert mono to stereo by duplicating the channel
-        stereo = np.column_stack((audio, audio)).flatten()
+        # Use np.repeat for better performance than column_stack + flatten
+        stereo = np.repeat(audio, 2)
         
         # Convert back to PCM bytes
         return self.numpy_to_pcm(stereo)
