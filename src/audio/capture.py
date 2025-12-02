@@ -10,6 +10,10 @@ from .processor import AudioProcessor
 
 logger = get_logger("audio.capture")
 
+# VAD/Energy detection constants
+VAD_ENERGY_THRESHOLD = 0.01  # RMS energy threshold for speech detection
+VAD_SILENCE_FRAMES = 25  # Number of consecutive silent frames before silence is confirmed (~500ms at 20ms frames)
+
 
 class AudioCapture:
     """Captures and buffers audio from Discord voice channels.
@@ -61,6 +65,16 @@ class AudioCapture:
         
         # Callback for processed audio chunks (takes user_id now)
         self._audio_callback: Optional[Callable[[bytes, int], Awaitable[None]]] = None
+        
+        # Real-time streaming queue for Gemini (low-latency path)
+        # Max size prevents unbounded growth if consumer is slow
+        self._streaming_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self._is_streaming_to_gemini = False
+        
+        # VAD state for silence detection
+        self._consecutive_silent_frames = 0
+        self._speech_detected = False
+        self._silence_detected_event: Optional[asyncio.Event] = None
         
         # State
         self._is_capturing = False
@@ -155,6 +169,9 @@ class AudioCapture:
         This method maintains separate buffers per user to enable accurate
         wake word detection when multiple users are in the voice channel.
         
+        When streaming mode is active and this is the active user, frames are
+        pushed directly to the streaming queue for low-latency Gemini streaming.
+        
         Args:
             pcm_data: Raw PCM audio from Discord.
             user_id: Discord user ID this audio came from.
@@ -181,16 +198,40 @@ class AudioCapture:
                 removed = self._user_buffers[user_id].popleft()
                 self._user_buffer_samples[user_id] -= len(removed)
         
-        # Also add to shared buffer if this is the active user (for Gemini streaming)
+        # Real-time streaming path for active user
         if self._active_user_id is not None and user_id == self._active_user_id:
-            async with self._lock:
-                self._buffer.append(audio)
-                self._buffer_samples += len(audio)
+            # If streaming mode is active, push directly to queue (no concatenation!)
+            if self._is_streaming_to_gemini:
+                # Perform VAD on this frame
+                rms_energy = self._compute_rms_energy(audio)
+                is_speech = rms_energy > VAD_ENERGY_THRESHOLD
                 
-                # Trim shared buffer if too large
-                while self._buffer_samples > self._max_buffer_samples:
-                    removed = self._buffer.popleft()
-                    self._buffer_samples -= len(removed)
+                if is_speech:
+                    self._speech_detected = True
+                    self._consecutive_silent_frames = 0
+                else:
+                    if self._speech_detected:
+                        self._consecutive_silent_frames += 1
+                        # Check if we've detected end of speech
+                        if self._consecutive_silent_frames >= VAD_SILENCE_FRAMES:
+                            if self._silence_detected_event:
+                                self._silence_detected_event.set()
+                
+                # Push frame directly to streaming queue
+                try:
+                    self._streaming_queue.put_nowait(gemini_pcm)
+                except asyncio.QueueFull:
+                    logger.warning("Streaming queue full, dropping frame")
+            else:
+                # Legacy path: buffer for later concatenation
+                async with self._lock:
+                    self._buffer.append(audio)
+                    self._buffer_samples += len(audio)
+                    
+                    # Trim shared buffer if too large
+                    while self._buffer_samples > self._max_buffer_samples:
+                        removed = self._buffer.popleft()
+                        self._buffer_samples -= len(removed)
         
         # Call callback with converted audio and user ID
         if self._audio_callback:
@@ -396,3 +437,102 @@ class AudioCapture:
         """
         samples = self._user_buffer_samples.get(user_id, 0)
         return samples / self.processor.gemini_input_sample_rate
+    
+    # =========================================================================
+    # Real-time streaming and VAD methods
+    # =========================================================================
+    
+    def start_streaming_to_gemini(self) -> None:
+        """Start streaming mode for real-time audio to Gemini.
+        
+        In streaming mode, audio frames are pushed to a queue immediately
+        instead of being buffered for later concatenation.
+        """
+        self._is_streaming_to_gemini = True
+        self._consecutive_silent_frames = 0
+        self._speech_detected = False
+        self._silence_detected_event = asyncio.Event()
+        # Clear the queue
+        while not self._streaming_queue.empty():
+            try:
+                self._streaming_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        logger.debug("Started streaming mode for Gemini")
+    
+    def stop_streaming_to_gemini(self) -> None:
+        """Stop streaming mode."""
+        self._is_streaming_to_gemini = False
+        self._speech_detected = False
+        self._consecutive_silent_frames = 0
+        if self._silence_detected_event:
+            self._silence_detected_event.set()  # Unblock any waiters
+        logger.debug("Stopped streaming mode for Gemini")
+    
+    async def get_streaming_chunk(self, timeout: float = 0.1) -> Optional[bytes]:
+        """Get the next audio chunk from the streaming queue.
+        
+        This is the low-latency path for real-time streaming to Gemini.
+        Frames are pushed directly without concatenation.
+        
+        Args:
+            timeout: Maximum time to wait for a chunk.
+            
+        Returns:
+            PCM audio bytes, or None if timeout.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._streaming_queue.get(),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return None
+    
+    def _compute_rms_energy(self, audio: np.ndarray) -> float:
+        """Compute RMS energy of audio samples.
+        
+        Args:
+            audio: Audio samples as numpy array.
+            
+        Returns:
+            RMS energy value.
+        """
+        if len(audio) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(audio ** 2)))
+    
+    def is_silence_detected(self) -> bool:
+        """Check if silence has been detected after speech.
+        
+        Returns:
+            True if user stopped speaking (speech detected, then silence).
+        """
+        return self._speech_detected and self._consecutive_silent_frames >= VAD_SILENCE_FRAMES
+    
+    async def wait_for_silence(self, timeout: float = 5.0) -> bool:
+        """Wait for silence to be detected after speech.
+        
+        Args:
+            timeout: Maximum time to wait.
+            
+        Returns:
+            True if silence detected, False if timeout.
+        """
+        if not self._silence_detected_event:
+            return False
+        try:
+            await asyncio.wait_for(
+                self._silence_detected_event.wait(),
+                timeout=timeout
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+    
+    def reset_vad_state(self) -> None:
+        """Reset VAD state for new detection."""
+        self._consecutive_silent_frames = 0
+        self._speech_detected = False
+        if self._silence_detected_event:
+            self._silence_detected_event.clear()

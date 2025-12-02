@@ -61,12 +61,15 @@ gemini:
 # Bot Behavior
 # ------------------------------------------------------------
 behavior:
-  # How long to capture speech after wake word (seconds)
+  # Maximum time to capture speech after wake word (seconds)
+  # With VAD (voice activity detection), capture will end early when
+  # silence is detected, so this is just a safety limit.
   # Increase if your questions get cut off
-  capture_duration: 5.0
+  capture_duration: 10.0
   
-  # Seconds of silence before ending capture
-  # Decrease for faster response, increase for longer pauses
+  # Seconds of silence before ending capture (used by VAD)
+  # Lower = faster response after you stop speaking
+  # Higher = more tolerance for pauses mid-sentence
   silence_threshold: 0.5
 
 # ------------------------------------------------------------

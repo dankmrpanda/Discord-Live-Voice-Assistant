@@ -1,7 +1,8 @@
-"""Audio playback to Discord voice channels."""
+"""Audio playback to Discord voice channels with streaming support."""
 
 import asyncio
 import io
+from collections import deque
 from typing import Optional, Callable
 
 import discord
@@ -61,6 +62,86 @@ class PCMVolumeTransformer(discord.AudioSource):
         self._pcm_data = b""
 
 
+class StreamingPCMSource(discord.AudioSource):
+    """Audio source that streams from a queue for low-latency playback.
+    
+    This source reads from an asyncio Queue, allowing audio to be played
+    as soon as chunks arrive from Gemini, rather than waiting for the
+    full response.
+    """
+    
+    # Discord expects 20ms frames of stereo 48kHz 16-bit audio
+    FRAME_SIZE = 3840  # 48000 * 2 bytes * 2 channels * 0.02 seconds
+    
+    def __init__(self, processor: AudioProcessor, volume: float = 1.0):
+        """Initialize the streaming audio source.
+        
+        Args:
+            processor: AudioProcessor for format conversion.
+            volume: Volume multiplier (0.0 to 2.0).
+        """
+        self._processor = processor
+        self._volume = volume
+        self._buffer = bytearray()
+        self._chunk_queue: deque[bytes] = deque()
+        self._is_finished = False
+        self._lock = asyncio.Lock()
+    
+    def add_chunk(self, gemini_audio: bytes) -> None:
+        """Add a chunk of Gemini audio to the playback queue.
+        
+        Args:
+            gemini_audio: PCM audio from Gemini (24kHz mono).
+        """
+        # Convert to Discord format (48kHz stereo)
+        discord_pcm = self._processor.gemini_to_discord(gemini_audio)
+        self._chunk_queue.append(discord_pcm)
+    
+    def mark_finished(self) -> None:
+        """Mark that no more chunks will be added."""
+        self._is_finished = True
+    
+    def read(self) -> bytes:
+        """Read the next frame of audio.
+        
+        Returns:
+            20ms of audio data, or empty bytes if finished.
+        """
+        # Fill buffer from queue if needed
+        while len(self._buffer) < self.FRAME_SIZE and self._chunk_queue:
+            chunk = self._chunk_queue.popleft()
+            self._buffer.extend(chunk)
+        
+        # If buffer has enough data, return a frame
+        if len(self._buffer) >= self.FRAME_SIZE:
+            frame = bytes(self._buffer[:self.FRAME_SIZE])
+            del self._buffer[:self.FRAME_SIZE]
+            return frame
+        
+        # If finished and buffer has remaining data, pad and return
+        if self._is_finished:
+            if len(self._buffer) > 0:
+                frame = bytes(self._buffer)
+                self._buffer.clear()
+                # Pad to frame size
+                if len(frame) < self.FRAME_SIZE:
+                    frame += b"\x00" * (self.FRAME_SIZE - len(frame))
+                return frame
+            return b""
+        
+        # Not finished but buffer empty - return silence to keep stream alive
+        return b"\x00" * self.FRAME_SIZE
+    
+    def is_opus(self) -> bool:
+        """Check if the audio source is Opus encoded."""
+        return False
+    
+    def cleanup(self) -> None:
+        """Clean up resources."""
+        self._buffer.clear()
+        self._chunk_queue.clear()
+
+
 class AudioPlayback:
     """Manages audio playback to Discord voice channels."""
     
@@ -82,6 +163,10 @@ class AudioPlayback:
         self._is_playing = False
         self._playback_complete_event: Optional[asyncio.Event] = None
         self._after_callback: Optional[Callable[[], None]] = None
+        
+        # Streaming playback support
+        self._streaming_source: Optional[StreamingPCMSource] = None
+        self._is_streaming = False
     
     def set_voice_client(self, voice_client: Optional[discord.VoiceClient]) -> None:
         """Set the Discord voice client for playback.
@@ -167,3 +252,77 @@ class AudioPlayback:
         if self._voice_client and self._voice_client.is_playing():
             self._voice_client.stop()
         self._is_playing = False
+        self._is_streaming = False
+        self._streaming_source = None
+    
+    # =========================================================================
+    # Streaming playback methods for low-latency response
+    # =========================================================================
+    
+    def start_streaming_playback(self) -> bool:
+        """Start streaming playback mode.
+        
+        This starts playing immediately and audio chunks can be added
+        as they arrive from Gemini.
+        
+        Returns:
+            True if streaming started successfully.
+        """
+        if not self._voice_client or not self._voice_client.is_connected():
+            logger.warning("Cannot start streaming: not connected to voice channel")
+            return False
+        
+        if self._voice_client.is_playing():
+            logger.debug("Stopping current playback for streaming")
+            self._voice_client.stop()
+        
+        # Create streaming source
+        self._streaming_source = StreamingPCMSource(self.processor, volume=self.volume)
+        
+        # Set up completion tracking
+        self._is_playing = True
+        self._is_streaming = True
+        self._playback_complete_event = asyncio.Event()
+        
+        def after_playback(error):
+            if error:
+                logger.error(f"Streaming playback error: {error}")
+            self._is_playing = False
+            self._is_streaming = False
+            self._streaming_source = None
+            if self._playback_complete_event:
+                self._playback_complete_event.set()
+            if self._after_callback:
+                self._after_callback()
+        
+        # Start playback with streaming source
+        self._voice_client.play(self._streaming_source, after=after_playback)
+        logger.debug("Started streaming playback")
+        return True
+    
+    def add_streaming_chunk(self, gemini_audio: bytes) -> bool:
+        """Add an audio chunk to the streaming playback.
+        
+        Args:
+            gemini_audio: PCM audio from Gemini (24kHz mono).
+            
+        Returns:
+            True if chunk was added successfully.
+        """
+        if not self._streaming_source or not self._is_streaming:
+            logger.warning("Cannot add chunk: not in streaming mode")
+            return False
+        
+        self._streaming_source.add_chunk(gemini_audio)
+        return True
+    
+    def finish_streaming(self) -> None:
+        """Mark streaming as complete (no more chunks will be added)."""
+        if self._streaming_source:
+            self._streaming_source.mark_finished()
+            logger.debug("Streaming marked as finished")
+    
+    @property
+    def is_streaming(self) -> bool:
+        """Check if currently in streaming playback mode."""
+        return self._is_streaming
