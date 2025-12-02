@@ -1,6 +1,7 @@
 """Gemini Live API client for real-time voice interaction."""
 
 import asyncio
+import time
 from enum import Enum
 from typing import Optional, Callable, Awaitable, AsyncIterator, List
 
@@ -16,6 +17,12 @@ class GeminiSessionState(Enum):
     CONNECTED = "connected"
     STREAMING = "streaming"
     ERROR = "error"
+
+
+# Health check / keep-alive configuration
+HEALTH_CHECK_INTERVAL_S = 30.0  # Check connection health every 30 seconds
+MAX_IDLE_TIME_S = 60.0  # Reconnect if idle for more than 60 seconds
+MAX_CONSECUTIVE_ERRORS = 3  # Reconnect after 3 consecutive errors
 
 
 class GeminiLiveClient:
@@ -75,6 +82,12 @@ class GeminiLiveClient:
         # Audio buffer for collecting response
         self._audio_buffer: List[bytes] = []
 
+        # Health check / keep-alive state
+        self._last_activity_time: float = 0.0
+        self._consecutive_errors: int = 0
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._keep_alive_enabled: bool = False
+
         self._initialize_client()
 
     # --------------------------------------------------------------------- #
@@ -117,6 +130,139 @@ class GeminiLiveClient:
     def is_connected(self) -> bool:
         """Check if session is connected."""
         return self._state in (GeminiSessionState.CONNECTED, GeminiSessionState.STREAMING)
+
+    # --------------------------------------------------------------------- #
+    # Health check / keep-alive
+    # --------------------------------------------------------------------- #
+
+    def _update_activity(self) -> None:
+        """Update the last activity timestamp."""
+        self._last_activity_time = time.time()
+        self._consecutive_errors = 0  # Reset error count on successful activity
+        logger.debug("📊 Activity timestamp updated")
+
+    def _record_error(self) -> None:
+        """Record a connection error for health monitoring."""
+        self._consecutive_errors += 1
+        logger.warning(f"⚠️ Consecutive errors: {self._consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+    async def start_health_check(self) -> None:
+        """Start the background health check task.
+        
+        This periodically checks connection health and pre-emptively
+        reconnects if the session appears stale or has too many errors.
+        """
+        if self._health_check_task and not self._health_check_task.done():
+            logger.debug("Health check task already running")
+            return
+
+        self._keep_alive_enabled = True
+        self._health_check_task = asyncio.create_task(self._health_check_loop())
+        logger.info("🏥 Started Gemini health check background task")
+
+    async def stop_health_check(self) -> None:
+        """Stop the background health check task."""
+        self._keep_alive_enabled = False
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
+            self._health_check_task = None
+        logger.info("🏥 Stopped Gemini health check background task")
+
+    async def _health_check_loop(self) -> None:
+        """Background loop to monitor connection health."""
+        logger.debug("Health check loop started")
+        while self._keep_alive_enabled:
+            try:
+                await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
+                
+                if not self._keep_alive_enabled:
+                    break
+                
+                await self._perform_health_check()
+                
+            except asyncio.CancelledError:
+                logger.debug("Health check loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Health check loop error: {e}")
+                await asyncio.sleep(5.0)  # Brief pause before retrying
+
+        logger.debug("Health check loop ended")
+
+    async def _perform_health_check(self) -> None:
+        """Perform a single health check and reconnect if needed."""
+        current_time = time.time()
+        
+        # Check if we're in an error state
+        if self._state == GeminiSessionState.ERROR:
+            logger.warning("🔄 Health check: Session in ERROR state, attempting reconnect...")
+            await self._attempt_reconnect()
+            return
+
+        # Check for too many consecutive errors
+        if self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            logger.warning(
+                f"🔄 Health check: {self._consecutive_errors} consecutive errors, "
+                "attempting reconnect..."
+            )
+            await self._attempt_reconnect()
+            return
+
+        # Check for idle timeout (only if we're supposed to be connected)
+        if self.is_connected and self._last_activity_time > 0:
+            idle_time = current_time - self._last_activity_time
+            if idle_time > MAX_IDLE_TIME_S:
+                logger.info(
+                    f"🔄 Health check: Session idle for {idle_time:.1f}s "
+                    f"(threshold: {MAX_IDLE_TIME_S}s), refreshing connection..."
+                )
+                await self._attempt_reconnect()
+                return
+
+        # Log healthy status periodically
+        if self.is_connected:
+            idle_time = current_time - self._last_activity_time if self._last_activity_time > 0 else 0
+            logger.debug(
+                f"✅ Health check passed: state={self._state.value}, "
+                f"idle={idle_time:.1f}s, errors={self._consecutive_errors}"
+            )
+
+    async def _attempt_reconnect(self) -> bool:
+        """Attempt to reconnect to the Gemini Live API.
+        
+        Returns:
+            True if reconnection successful, False otherwise.
+        """
+        logger.info("🔄 Attempting Gemini reconnection...")
+        
+        try:
+            # Disconnect cleanly first
+            await self.disconnect()
+            
+            # Brief pause before reconnecting
+            await asyncio.sleep(0.5)
+            
+            # Attempt to reconnect
+            success = await self.connect()
+            
+            if success:
+                logger.info("✅ Gemini reconnection successful")
+                self._consecutive_errors = 0
+                self._update_activity()
+                return True
+            else:
+                logger.error("❌ Gemini reconnection failed")
+                self._record_error()
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Gemini reconnection error: {e}")
+            self._record_error()
+            return False
 
     # --------------------------------------------------------------------- #
     # Callback registration
@@ -171,31 +317,10 @@ class GeminiLiveClient:
             logger.info("Connecting to Gemini Live API...")
             logger.debug(f"Model: {self.model}, Voice: {self.voice}")
 
-            # Official-style config for audio output + voice :contentReference[oaicite:3]{index=3}
-            # Safety settings: BLOCK_NONE for all categories (uncensored/unfiltered)
-            safety_settings = [
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HARASSMENT",
-                    threshold="BLOCK_NONE",
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HATE_SPEECH",
-                    threshold="BLOCK_NONE",
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    threshold="BLOCK_NONE",
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_NONE",
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_CIVIC_INTEGRITY",
-                    threshold="BLOCK_NONE",
-                ),
-            ]
-
+            # Official-style config for audio output + voice
+            # Note: safety_settings is NOT supported in LiveConnectConfig for
+            # the gemini-2.5-flash-native-audio-preview models. Only include it
+            # for models that support it.
             config = types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
@@ -210,8 +335,6 @@ class GeminiLiveClient:
                 # You *can* pass system_instruction here as a string.
                 # Using plain string avoids schema issues.
                 system_instruction=self.system_instruction,
-                # Disable all safety filters for uncensored responses
-                safety_settings=safety_settings,
             )
 
             logger.debug("Establishing WebSocket connection...")
@@ -226,6 +349,7 @@ class GeminiLiveClient:
             connect_time = time.time() - connect_start
 
             self._state = GeminiSessionState.CONNECTED
+            self._update_activity()  # Mark successful connection
             logger.info(
                 f"Connected to Gemini Live API in {connect_time:.3f}s (voice: {self.voice})"
             )
@@ -235,6 +359,7 @@ class GeminiLiveClient:
             logger.error(f"Failed to connect to Gemini: {e}")
             logger.debug(f"Connection error details: {type(e).__name__}: {e}")
             self._state = GeminiSessionState.ERROR
+            self._record_error()  # Track connection failure
             return False
 
     async def disconnect(self) -> None:
@@ -305,11 +430,13 @@ class GeminiLiveClient:
             )
 
             self._state = GeminiSessionState.STREAMING
+            self._update_activity()  # Mark successful send
             logger.debug("Audio sent successfully")
 
         except Exception as e:
             logger.error(f"Error sending audio: {e}")
             logger.debug(f"Send audio error details: {type(e).__name__}: {e}")
+            self._record_error()  # Track send failure
 
     async def send_text(self, text: str) -> None:
         """Send a text turn to Gemini (text-in, audio-out)."""
@@ -450,6 +577,7 @@ class GeminiLiveClient:
                 # ---- Turn completion ----
                 if server_content and getattr(server_content, "turn_complete", False):
                     elapsed = time.time() - receive_start
+                    self._update_activity()  # Mark successful response completion
                     logger.info(
                         f"Gemini response complete: {chunk_count} chunks, "
                         f"{total_bytes} bytes in {elapsed:.3f}s"
@@ -477,6 +605,7 @@ class GeminiLiveClient:
                 )
 
             self._state = GeminiSessionState.ERROR
+            self._record_error()  # Track receive failure
 
     async def get_full_audio_response(self) -> bytes:
         """Collect full audio response."""

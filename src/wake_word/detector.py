@@ -1,6 +1,7 @@
 """Wake word detection using OpenWakeWord with per-user support."""
 
 import asyncio
+import concurrent.futures
 from typing import Optional, Callable, Awaitable, Dict, Tuple
 import numpy as np
 
@@ -17,6 +18,23 @@ AVAILABLE_MODELS = {
     "weather": "weather_v0.1",
 }
 
+# Thread pool for CPU-bound wake word inference
+# This prevents blocking the event loop during model.predict()
+_inference_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _get_inference_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Get or create the thread pool executor for wake word inference."""
+    global _inference_executor
+    if _inference_executor is None:
+        # Use 2 threads - one for inference, one spare for user model creation
+        _inference_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="wake_word_inference"
+        )
+        logger.debug("Created wake word inference thread pool")
+    return _inference_executor
+
 
 class WakeWordDetector:
     """Detects wake words in audio using OpenWakeWord with per-user support.
@@ -24,6 +42,8 @@ class WakeWordDetector:
     This class wraps OpenWakeWord to provide async-friendly wake word
     detection for the Discord voice bot. Each user gets their own detector
     state to prevent audio mixing issues with 3+ users.
+    
+    Inference is offloaded to a thread pool to avoid blocking the event loop.
     """
     
     def __init__(
@@ -56,6 +76,10 @@ class WakeWordDetector:
         self._user_process_counts: Dict[int, int] = {}
         self._user_last_scores: Dict[int, dict] = {}
         
+        # Pre-warmed models ready for new users
+        self._prewarmed_models: list = []
+        self._prewarm_count = 2  # Number of models to keep pre-warmed
+        
         self._is_enabled = True
         self._detection_callback: Optional[Callable[[int], Awaitable[None]]] = None  # Now takes user_id
         self._process_count = 0
@@ -68,7 +92,7 @@ class WakeWordDetector:
         self._load_model()
     
     def _load_model(self) -> None:
-        """Load the OpenWakeWord model."""
+        """Load the OpenWakeWord model and pre-warm user models."""
         try:
             logger.debug("Importing openwakeword library")
             import openwakeword
@@ -93,6 +117,9 @@ class WakeWordDetector:
             logger.info(f"Detection threshold: {self.threshold}")
             logger.info("Per-user detection enabled for multi-user voice channels")
             
+            # Pre-warm models for new users (to avoid load-time latency)
+            self._prewarm_models()
+            
         except ImportError as e:
             logger.error(f"Failed to import openwakeword: {e}")
             logger.error("Install with: pip install openwakeword")
@@ -102,8 +129,32 @@ class WakeWordDetector:
             logger.debug(f"Model load error details: {type(e).__name__}: {e}")
             raise
     
+    def _prewarm_models(self) -> None:
+        """Pre-warm wake word models for new users.
+        
+        This creates a pool of ready-to-use models so that when a new user
+        joins, we don't have to wait for model initialization.
+        """
+        try:
+            from openwakeword.model import Model
+            
+            models_to_create = self._prewarm_count - len(self._prewarmed_models)
+            if models_to_create > 0:
+                logger.info(f"Pre-warming {models_to_create} wake word models...")
+                for _ in range(models_to_create):
+                    model = Model(
+                        wakeword_models=[self._model_name],
+                        inference_framework="onnx",
+                    )
+                    self._prewarmed_models.append(model)
+                logger.info(f"Pre-warmed {models_to_create} models (total pool: {len(self._prewarmed_models)})")
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm models: {e}")
+    
     def _get_or_create_user_model(self, user_id: int) -> object:
         """Get or create a model instance for a specific user.
+        
+        Uses pre-warmed models when available to avoid load-time latency.
         
         Args:
             user_id: Discord user ID.
@@ -113,14 +164,27 @@ class WakeWordDetector:
         """
         if user_id not in self._user_models:
             try:
-                from openwakeword.model import Model
-                self._user_models[user_id] = Model(
-                    wakeword_models=[self._model_name],
-                    inference_framework="onnx",
-                )
+                # Try to use a pre-warmed model first (instant)
+                if self._prewarmed_models:
+                    model = self._prewarmed_models.pop()
+                    self._user_models[user_id] = model
+                    logger.info(f"Assigned pre-warmed wake word model to user {user_id} (pool remaining: {len(self._prewarmed_models)})")
+                    
+                    # Asynchronously replenish the pool
+                    asyncio.get_event_loop().call_soon(self._prewarm_models)
+                else:
+                    # Fall back to creating a new model (has load latency)
+                    from openwakeword.model import Model
+                    logger.debug(f"Creating new wake word model for user {user_id} (no pre-warmed models available)")
+                    self._user_models[user_id] = Model(
+                        wakeword_models=[self._model_name],
+                        inference_framework="onnx",
+                    )
+                    logger.info(f"Created wake word model for user {user_id}")
+                
                 self._user_process_counts[user_id] = 0
                 self._user_last_scores[user_id] = {}
-                logger.info(f"Created wake word model for user {user_id}")
+                
             except Exception as e:
                 logger.error(f"Failed to create model for user {user_id}: {e}")
                 # Fall back to shared model
@@ -193,6 +257,8 @@ class WakeWordDetector:
         This method maintains separate model state per user, preventing
         audio mixing issues when multiple users are in the voice channel.
         
+        Inference is run in a thread executor to avoid blocking the event loop.
+        
         Args:
             audio_data: PCM audio bytes (16kHz, 16-bit, mono).
             user_id: Discord user ID this audio came from.
@@ -213,8 +279,16 @@ class WakeWordDetector:
         # Convert bytes to numpy array
         audio_np = np.frombuffer(audio_data, dtype=np.int16)
         
-        # Run prediction
-        prediction = model.predict(audio_np)
+        # Run prediction in thread executor to avoid blocking event loop
+        # This is CPU-bound work that can take several milliseconds
+        loop = asyncio.get_event_loop()
+        executor = _get_inference_executor()
+        try:
+            prediction = await loop.run_in_executor(executor, model.predict, audio_np)
+        except Exception as e:
+            logger.error(f"Error running wake word prediction for user {user_id}: {e}")
+            return False
+        
         self._user_last_scores[user_id] = prediction
         
         # Check if any model detected wake word above threshold

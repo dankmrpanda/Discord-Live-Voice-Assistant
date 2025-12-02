@@ -75,7 +75,10 @@ class VoiceHandler:
             gemini_output_sample_rate=config.gemini_output_sample_rate,
         )
         
-        self._capture = AudioCapture(self._processor)
+        self._capture = AudioCapture(
+            self._processor,
+            silence_threshold=self.silence_threshold,
+        )
         self._playback = AudioPlayback(self._processor)
         
         # Create sink for receiving Discord audio
@@ -137,6 +140,8 @@ class VoiceHandler:
         
         if "silence_threshold" in changed_fields:
             self.silence_threshold = config.silence_threshold
+            # Also update the AudioCapture's VAD threshold
+            self._capture.set_silence_threshold(config.silence_threshold)
             logger.info(f"  → Silence threshold: {self.silence_threshold}s")
         
         if "log_audio" in changed_fields:
@@ -371,6 +376,10 @@ class VoiceHandler:
             await self._gemini.connect()
             logger.debug("Gemini connection established")
             
+            # Start Gemini health check / keep-alive task
+            logger.debug("Starting Gemini health check background task")
+            await self._gemini.start_health_check()
+            
             # Transition to listening state
             await self._set_state(BotState.LISTENING)
             
@@ -435,7 +444,8 @@ class VoiceHandler:
                 pass
             self._receive_task = None
         
-        # Disconnect from Gemini
+        # Stop Gemini health check and disconnect
+        await self._gemini.stop_health_check()
         await self._gemini.disconnect()
         
         # Disconnect from voice
@@ -598,34 +608,54 @@ class VoiceHandler:
         
         This runs concurrently with receive, so response can start playing
         while user is still speaking.
+        
+        Uses multiple end-of-speech detection strategies:
+        1. VAD silence detection (speech followed by silence frames)
+        2. No-chunk timeout (Discord stops sending when user is quiet)
+        3. Max capture duration (safety limit)
         """
         import time
         
         capture_start = time.time()
         total_audio_bytes = 0
         max_duration = self.capture_duration  # Max capture time as safety limit
-        silence_threshold_seconds = self.silence_threshold
         
-        logger.debug(f"📤 Starting audio send loop (max {max_duration}s, silence threshold {silence_threshold_seconds}s)")
+        # No-chunk timeout - if Discord stops sending frames, user has stopped speaking
+        # This is more reliable than VAD alone since Discord stops delivering audio on silence
+        no_chunk_timeout = 0.3  # 300ms without chunks = user stopped
+        last_chunk_time = time.time()
+        received_at_least_one_chunk = False
+        
+        logger.debug(f"📤 Starting audio send loop (max {max_duration}s, no-chunk timeout {no_chunk_timeout}s)")
         
         try:
             while self._is_capturing_for_gemini:
-                elapsed = time.time() - capture_start
+                current_time = time.time()
+                elapsed = current_time - capture_start
                 
-                # Check for timeout
+                # Check for max duration timeout
                 if elapsed >= max_duration:
                     logger.info(f"📤 Max capture duration reached ({max_duration}s)")
                     break
                 
-                # Check for silence detection (VAD)
+                # Check for VAD silence detection
                 if self._capture.is_silence_detected():
-                    logger.info(f"📤 Silence detected after speech ({elapsed:.1f}s), ending capture")
+                    logger.info(f"📤 VAD silence detected after speech ({elapsed:.1f}s), ending capture")
                     break
+                
+                # Check for no-chunk timeout (Discord stopped sending = user stopped talking)
+                if received_at_least_one_chunk:
+                    time_since_last_chunk = current_time - last_chunk_time
+                    if time_since_last_chunk >= no_chunk_timeout:
+                        logger.info(f"📤 No chunks for {time_since_last_chunk:.2f}s - user stopped speaking, ending capture")
+                        break
                 
                 # Get audio chunk from streaming queue (non-blocking with short timeout)
                 chunk = await self._capture.get_streaming_chunk(timeout=0.02)
                 
                 if chunk and len(chunk) > 0:
+                    received_at_least_one_chunk = True
+                    last_chunk_time = current_time
                     total_audio_bytes += len(chunk)
                     self._audio_chunks_sent += 1
                     

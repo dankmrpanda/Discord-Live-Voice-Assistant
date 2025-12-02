@@ -12,7 +12,8 @@ logger = get_logger("audio.capture")
 
 # VAD/Energy detection constants
 VAD_ENERGY_THRESHOLD = 0.01  # RMS energy threshold for speech detection
-VAD_SILENCE_FRAMES = 25  # Number of consecutive silent frames before silence is confirmed (~500ms at 20ms frames)
+DEFAULT_SILENCE_DURATION = 0.5  # Default seconds of silence before ending (configurable)
+FRAME_DURATION_MS = 20  # Approximate duration of each Discord audio frame in ms
 
 
 class AudioCapture:
@@ -31,6 +32,7 @@ class AudioCapture:
         processor: AudioProcessor,
         buffer_duration: float = 30.0,
         chunk_duration: float = 0.1,
+        silence_threshold: float = DEFAULT_SILENCE_DURATION,
     ):
         """Initialize the audio capture.
         
@@ -38,10 +40,17 @@ class AudioCapture:
             processor: AudioProcessor instance for format conversion.
             buffer_duration: Maximum duration of audio to buffer (seconds).
             chunk_duration: Duration of each audio chunk for processing (seconds).
+            silence_threshold: Seconds of silence before ending capture (configurable).
         """
         self.processor = processor
         self.buffer_duration = buffer_duration
         self.chunk_duration = chunk_duration
+        self.silence_threshold = silence_threshold
+        
+        # Calculate VAD silence frames from threshold
+        # Each frame is ~20ms, so frames = threshold_seconds / 0.02
+        self._vad_silence_frames = int(silence_threshold / (FRAME_DURATION_MS / 1000))
+        logger.debug(f"VAD configured: silence_threshold={silence_threshold}s -> {self._vad_silence_frames} frames")
         
         # Calculate buffer sizes
         self._samples_per_chunk = int(
@@ -213,7 +222,8 @@ class AudioCapture:
                     if self._speech_detected:
                         self._consecutive_silent_frames += 1
                         # Check if we've detected end of speech
-                        if self._consecutive_silent_frames >= VAD_SILENCE_FRAMES:
+                        if self._consecutive_silent_frames >= self._vad_silence_frames:
+                            logger.debug(f"VAD: Silence detected after {self._consecutive_silent_frames} frames")
                             if self._silence_detected_event:
                                 self._silence_detected_event.set()
                 
@@ -508,7 +518,7 @@ class AudioCapture:
         Returns:
             True if user stopped speaking (speech detected, then silence).
         """
-        return self._speech_detected and self._consecutive_silent_frames >= VAD_SILENCE_FRAMES
+        return self._speech_detected and self._consecutive_silent_frames >= self._vad_silence_frames
     
     async def wait_for_silence(self, timeout: float = 5.0) -> bool:
         """Wait for silence to be detected after speech.
@@ -536,3 +546,13 @@ class AudioCapture:
         self._speech_detected = False
         if self._silence_detected_event:
             self._silence_detected_event.clear()
+    
+    def set_silence_threshold(self, threshold_seconds: float) -> None:
+        """Update the silence detection threshold.
+        
+        Args:
+            threshold_seconds: New silence threshold in seconds.
+        """
+        self.silence_threshold = threshold_seconds
+        self._vad_silence_frames = int(threshold_seconds / (FRAME_DURATION_MS / 1000))
+        logger.info(f"VAD silence threshold updated: {threshold_seconds}s -> {self._vad_silence_frames} frames")
