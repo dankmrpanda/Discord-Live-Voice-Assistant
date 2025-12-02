@@ -172,6 +172,30 @@ class GeminiLiveClient:
             logger.debug(f"Model: {self.model}, Voice: {self.voice}")
 
             # Official-style config for audio output + voice :contentReference[oaicite:3]{index=3}
+            # Safety settings: BLOCK_NONE for all categories (uncensored/unfiltered)
+            safety_settings = [
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_CIVIC_INTEGRITY",
+                    threshold="BLOCK_NONE",
+                ),
+            ]
+
             config = types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
@@ -186,6 +210,8 @@ class GeminiLiveClient:
                 # You *can* pass system_instruction here as a string.
                 # Using plain string avoids schema issues.
                 system_instruction=self.system_instruction,
+                # Disable all safety filters for uncensored responses
+                safety_settings=safety_settings,
             )
 
             logger.debug("Establishing WebSocket connection...")
