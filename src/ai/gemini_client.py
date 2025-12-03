@@ -21,7 +21,6 @@ class GeminiSessionState(Enum):
 
 # Health check / keep-alive configuration
 HEALTH_CHECK_INTERVAL_S = 30.0  # Check connection health every 30 seconds
-MAX_IDLE_TIME_S = 60.0  # Reconnect if idle for more than 60 seconds
 MAX_CONSECUTIVE_ERRORS = 3  # Reconnect after 3 consecutive errors
 
 
@@ -45,6 +44,10 @@ class GeminiLiveClient:
         voice: str = "Puck",
         system_instruction: Optional[str] = None,
         model: Optional[str] = None,
+        thinking: bool = False,
+        google_search: bool = False,
+        function_calling: bool = False,
+        automatic_function_response: bool = False,
     ):
         """Initialize the Gemini Live API client.
 
@@ -53,10 +56,20 @@ class GeminiLiveClient:
             voice: Voice to use for TTS (Puck, Charon, Kore, etc.).
             system_instruction: Optional system prompt for the model.
             model: Gemini model to use (defaults to gemini-2.0-flash-live-001).
+            thinking: Enable thinking mode for improved reasoning.
+            google_search: Enable Google Search grounding for up-to-date information.
+            function_calling: Enable function calling capabilities.
+            automatic_function_response: Enable automatic execution of function calls.
         """
         self.model = model or self.DEFAULT_MODEL
+        self.thinking = thinking
+        self.google_search = google_search
+        self.function_calling = function_calling
+        self.automatic_function_response = automatic_function_response
         logger.debug(
-            f"Initializing GeminiLiveClient with voice={voice}, model={self.model}"
+            f"Initializing GeminiLiveClient with voice={voice}, model={self.model}, "
+            f"thinking={thinking}, google_search={google_search}, "
+            f"function_calling={function_calling}, automatic_function_response={automatic_function_response}"
         )
 
         self.api_key = api_key
@@ -194,7 +207,13 @@ class GeminiLiveClient:
         logger.debug("Health check loop ended")
 
     async def _perform_health_check(self) -> None:
-        """Perform a single health check and reconnect if needed."""
+        """Perform a single health check and reconnect if needed.
+        
+        Note: We do NOT reconnect on idle timeout because that would reset
+        the conversation context. We only reconnect on actual errors.
+        The Gemini Live API session will remain active until explicitly
+        disconnected or an error occurs.
+        """
         current_time = time.time()
         
         # Check if we're in an error state
@@ -212,18 +231,7 @@ class GeminiLiveClient:
             await self._attempt_reconnect()
             return
 
-        # Check for idle timeout (only if we're supposed to be connected)
-        if self.is_connected and self._last_activity_time > 0:
-            idle_time = current_time - self._last_activity_time
-            if idle_time > MAX_IDLE_TIME_S:
-                logger.info(
-                    f"🔄 Health check: Session idle for {idle_time:.1f}s "
-                    f"(threshold: {MAX_IDLE_TIME_S}s), refreshing connection..."
-                )
-                await self._attempt_reconnect()
-                return
-
-        # Log healthy status periodically
+        # Log healthy status periodically (no idle timeout reconnection to preserve context)
         if self.is_connected:
             idle_time = current_time - self._last_activity_time if self._last_activity_time > 0 else 0
             logger.debug(
@@ -315,15 +323,18 @@ class GeminiLiveClient:
 
             self._state = GeminiSessionState.CONNECTING
             logger.info("Connecting to Gemini Live API...")
-            logger.debug(f"Model: {self.model}, Voice: {self.voice}")
+            logger.debug(f"Model: {self.model}, Voice: {self.voice}, Thinking: {self.thinking}")
+            logger.debug(f"Google Search: {self.google_search}, Function Calling: {self.function_calling}, Auto Function Response: {self.automatic_function_response}")
 
             # Official-style config for audio output + voice
             # Note: safety_settings is NOT supported in LiveConnectConfig for
             # the gemini-2.5-flash-native-audio-preview models. Only include it
             # for models that support it.
-            config = types.LiveConnectConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
+            
+            # Build config kwargs
+            config_kwargs = {
+                "response_modalities": ["AUDIO"],
+                "speech_config": types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
                             voice_name=self.voice,
@@ -334,8 +345,57 @@ class GeminiLiveClient:
                 ),
                 # You *can* pass system_instruction here as a string.
                 # Using plain string avoids schema issues.
-                system_instruction=self.system_instruction,
-            )
+                "system_instruction": self.system_instruction,
+            }
+            
+            # Add thinking config if enabled
+            if self.thinking:
+                logger.info("Thinking mode enabled - using ThinkingConfig")
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    include_thoughts=True,
+                )
+            
+            # Build tools list
+            tools = []
+            
+            # Add Google Search grounding if enabled
+            if self.google_search:
+                logger.info("Google Search grounding enabled")
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
+            
+            # Add function calling if enabled (placeholder for custom functions)
+            if self.function_calling:
+                logger.info("Function calling enabled")
+                # You can add custom function declarations here
+                # Example:
+                # tools.append(types.Tool(
+                #     function_declarations=[
+                #         types.FunctionDeclaration(
+                #             name="get_weather",
+                #             description="Get current weather for a location",
+                #             parameters={
+                #                 "type": "object",
+                #                 "properties": {
+                #                     "location": {"type": "string", "description": "City name"}
+                #                 },
+                #                 "required": ["location"]
+                #             }
+                #         )
+                #     ]
+                # ))
+                pass  # Custom functions can be added here
+            
+            # Add tools to config if any are defined
+            if tools:
+                config_kwargs["tools"] = tools
+            
+            # Note: automatic_function_response is handled at the session level
+            # for Live API, not in LiveConnectConfig. When tools are provided,
+            # the model can call them and the responses should be sent back.
+            if self.automatic_function_response:
+                logger.info("Automatic function response enabled (handled at session level)")
+            
+            config = types.LiveConnectConfig(**config_kwargs)
 
             logger.debug("Establishing WebSocket connection...")
             connect_start = time.time()

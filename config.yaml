@@ -56,6 +56,28 @@ gemini:
   #   - For Sulafat, Despina, Vindemiatrix: use gemini-2.5-flash-native-audio-preview-09-2025
   #   - For Puck, Charon, Kore, etc: use gemini-2.0-flash-live-001
   model: "gemini-2.5-flash-native-audio-preview-09-2025"
+  
+  # Enable thinking mode for the model
+  # When enabled, the model will use internal reasoning before responding,
+  # which can improve response quality for complex questions.
+  # Note: This may increase response latency.
+  thinking: true
+  
+  # Enable Google Search grounding
+  # When enabled, the model can search Google for up-to-date information
+  # to provide more accurate and current responses.
+  google_search: true
+  
+  # Enable function calling
+  # When enabled, the model can call predefined functions/tools.
+  # This is required for advanced features like code execution.
+  function_calling: true
+  
+  # Enable automatic function responses
+  # When enabled, the model will automatically execute function calls
+  # and include the results in its response.
+  # Requires function_calling to be enabled.
+  automatic_function_response: true
 
 # ------------------------------------------------------------
 # Bot Behavior
@@ -95,6 +117,13 @@ audio:
   
   # Gemini output sample rate (24kHz from Gemini TTS)
   gemini_output_sample_rate: 24000
+  
+  # Playback buffer delay in milliseconds
+  # The bot will wait until this much audio is buffered before starting playback.
+  # This helps prevent audio pops/stutters if chunks arrive slower than playback.
+  # Higher = more delay but smoother audio, Lower = less delay but may stutter
+  # Recommended: 100-300ms for stable playback
+  playback_buffer_ms: 200
 
 # ------------------------------------------------------------
 # Logging Settings
