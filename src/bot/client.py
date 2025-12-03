@@ -94,7 +94,77 @@ class DiscordBot(commands.Bot):
             
             await ctx.respond(embed=embed)
         
-        logger.debug("Slash commands registered: /join, /leave, /status")
+        @self.slash_command(name="ask", description="Send a text prompt to the bot (no wake word needed)")
+        async def ask_command(
+            ctx: discord.ApplicationContext,
+            prompt: discord.Option(str, description="Your question or prompt for the AI", required=True),  # type: ignore
+        ) -> None:
+            """Slash command to send a text prompt directly to the bot."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            
+            # Check if bot is connected to a voice channel
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond(
+                    "I'm not connected to a voice channel. Use `/join` first!",
+                    ephemeral=True,
+                )
+                return
+            
+            # Check if bot is currently busy
+            if handler.state in (BotState.PROCESSING, BotState.SPEAKING):
+                await ctx.respond(
+                    "I'm currently busy processing another request. Please wait a moment.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Check if bot is still connecting
+            if handler.state == BotState.CONNECTING:
+                await ctx.respond(
+                    "I'm still connecting to the voice channel. Please wait a moment.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Validate prompt
+            prompt = prompt.strip()
+            if not prompt:
+                await ctx.respond(
+                    "Please provide a non-empty prompt.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Limit prompt length to avoid abuse
+            max_prompt_length = 2000
+            if len(prompt) > max_prompt_length:
+                await ctx.respond(
+                    f"Prompt is too long. Maximum length is {max_prompt_length} characters.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Defer response since processing may take time
+            await ctx.defer()
+            
+            # Process the text prompt
+            try:
+                success = await handler.process_text_prompt(prompt, ctx.author.id)
+                if success:
+                    await ctx.followup.send(f"🎤 Processing: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*")
+                else:
+                    await ctx.followup.send(
+                        "Failed to process your prompt. Please try again.",
+                        ephemeral=True,
+                    )
+            except Exception as e:
+                logger.error(f"Error processing /ask command: {e}")
+                await ctx.followup.send(
+                    "An error occurred while processing your request. Please try again.",
+                    ephemeral=True,
+                )
+        
+        logger.debug("Slash commands registered: /join, /leave, /status, /ask")
     
     async def on_ready(self) -> None:
         """Handle bot ready event."""
@@ -120,6 +190,17 @@ class DiscordBot(commands.Bot):
         after: discord.VoiceState,
     ) -> None:
         """Handle voice state changes."""
+        # Handle other users leaving the voice channel
+        if member.id != self.user.id and before.channel and not after.channel:
+            guild_id = before.channel.guild.id
+            handler = self.get_voice_handler(guild_id)
+            
+            # Check if bot is in the same channel the user left from
+            if handler and handler.is_connected:
+                if handler._voice_client and handler._voice_client.channel == before.channel:
+                    logger.debug(f"User {member.name} ({member.id}) left voice channel, cleaning up resources")
+                    handler.cleanup_user(member.id)
+        
         # Only log our own voice state changes at debug level
         if member.id == self.user.id:
             logger.debug(f"Voice state update: {member.name} - before={before.channel}, after={after.channel}")

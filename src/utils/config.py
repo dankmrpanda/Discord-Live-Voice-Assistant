@@ -28,6 +28,10 @@ class Config:
     gemini_api_key: str
     gemini_voice: str = "Puck"
     gemini_model: str = "gemini-2.0-flash-live-001"
+    gemini_thinking: bool = False
+    gemini_google_search: bool = False
+    gemini_function_calling: bool = False
+    gemini_automatic_function_response: bool = False
     
     # Wake Word
     wake_phrase: str = "hey_jarvis"
@@ -50,6 +54,7 @@ class Config:
     gemini_input_sample_rate: int = 16000  # Gemini expects 16kHz
     gemini_output_sample_rate: int = 24000  # Gemini outputs 24kHz
     audio_channels: int = 1  # Mono
+    playback_buffer_ms: int = 200  # Buffer delay before playback starts
     
     # Internal: config file path for reloading
     _config_path: Optional[str] = field(default=None, repr=False)
@@ -101,6 +106,10 @@ class Config:
         # Get Gemini model settings (from config.yaml only)
         gemini_config = yaml_config.get("gemini", {})
         gemini_model = gemini_config.get("model", "gemini-2.0-flash-live-001")
+        gemini_thinking = gemini_config.get("thinking", False)
+        gemini_google_search = gemini_config.get("google_search", False)
+        gemini_function_calling = gemini_config.get("function_calling", False)
+        gemini_automatic_function_response = gemini_config.get("automatic_function_response", False)
         
         # Get behavior settings
         behavior_config = yaml_config.get("behavior", {})
@@ -122,6 +131,10 @@ class Config:
             gemini_api_key=gemini_key,
             gemini_voice=gemini_voice,
             gemini_model=gemini_model,
+            gemini_thinking=gemini_thinking,
+            gemini_google_search=gemini_google_search,
+            gemini_function_calling=gemini_function_calling,
+            gemini_automatic_function_response=gemini_automatic_function_response,
             wake_phrase=wake_phrase,
             wake_word_threshold=float(wake_threshold),
             capture_duration=behavior_config.get("capture_duration", 5.0),
@@ -133,6 +146,7 @@ class Config:
             discord_sample_rate=audio_config.get("discord_sample_rate", 48000),
             gemini_input_sample_rate=audio_config.get("gemini_input_sample_rate", 16000),
             gemini_output_sample_rate=audio_config.get("gemini_output_sample_rate", 24000),
+            playback_buffer_ms=audio_config.get("playback_buffer_ms", 200),
             _config_path=resolved_config_path,
         )
     
@@ -192,6 +206,22 @@ class Config:
         if self.gemini_model != new_model:
             changed_fields.append("gemini_model")
             self.gemini_model = new_model
+        new_thinking = gemini_config.get("thinking", False)
+        if self.gemini_thinking != new_thinking:
+            changed_fields.append("gemini_thinking")
+            self.gemini_thinking = new_thinking
+        new_google_search = gemini_config.get("google_search", False)
+        if self.gemini_google_search != new_google_search:
+            changed_fields.append("gemini_google_search")
+            self.gemini_google_search = new_google_search
+        new_function_calling = gemini_config.get("function_calling", False)
+        if self.gemini_function_calling != new_function_calling:
+            changed_fields.append("gemini_function_calling")
+            self.gemini_function_calling = new_function_calling
+        new_automatic_function_response = gemini_config.get("automatic_function_response", False)
+        if self.gemini_automatic_function_response != new_automatic_function_response:
+            changed_fields.append("gemini_automatic_function_response")
+            self.gemini_automatic_function_response = new_automatic_function_response
         
         # Behavior settings
         behavior_config = yaml_config.get("behavior", {})
@@ -210,6 +240,13 @@ class Config:
         if self.system_prompt != new_system_prompt:
             changed_fields.append("system_prompt")
             self.system_prompt = new_system_prompt
+        
+        # Audio settings
+        audio_config = yaml_config.get("audio", {})
+        new_playback_buffer_ms = audio_config.get("playback_buffer_ms", 200)
+        if self.playback_buffer_ms != new_playback_buffer_ms:
+            changed_fields.append("playback_buffer_ms")
+            self.playback_buffer_ms = new_playback_buffer_ms
         
         # Logging settings (from config.yaml only)
         logging_config = yaml_config.get("logging", {})

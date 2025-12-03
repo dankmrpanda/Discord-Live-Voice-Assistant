@@ -79,7 +79,10 @@ class VoiceHandler:
             self._processor,
             silence_threshold=self.silence_threshold,
         )
-        self._playback = AudioPlayback(self._processor)
+        self._playback = AudioPlayback(
+            self._processor,
+            buffer_ms=config.playback_buffer_ms,
+        )
         
         # Create sink for receiving Discord audio
         self._sink = WakeWordSink(capture=self._capture)
@@ -97,6 +100,10 @@ class VoiceHandler:
             voice=config.gemini_voice,
             system_instruction=getattr(config, 'system_prompt', None),
             model=config.gemini_model,
+            thinking=config.gemini_thinking,
+            google_search=config.gemini_google_search,
+            function_calling=config.gemini_function_calling,
+            automatic_function_response=config.gemini_automatic_function_response,
         )
         
         # Audio buffer for post-wake word capture
@@ -144,6 +151,10 @@ class VoiceHandler:
             self._capture.set_silence_threshold(config.silence_threshold)
             logger.info(f"  → Silence threshold: {self.silence_threshold}s")
         
+        if "playback_buffer_ms" in changed_fields:
+            self._playback.buffer_ms = config.playback_buffer_ms
+            logger.info(f"  → Playback buffer: {config.playback_buffer_ms}ms")
+        
         if "log_audio" in changed_fields:
             self.log_audio = config.log_audio
             self._wake_detector.verbose = config.log_audio
@@ -162,12 +173,25 @@ class VoiceHandler:
             self._wake_detector.set_detection_callback(self._on_wake_word_detected)
             logger.info("  → Wake word detector recreated")
         
-        # Update Gemini client if voice, model, or system prompt changed
-        if "gemini_voice" in changed_fields or "gemini_model" in changed_fields or "system_prompt" in changed_fields:
+        # Update Gemini client if voice, model, thinking, google_search, function_calling, automatic_function_response, or system prompt changed
+        gemini_changed = any(f in changed_fields for f in [
+            "gemini_voice", "gemini_model", "gemini_thinking", 
+            "gemini_google_search", "gemini_function_calling", 
+            "gemini_automatic_function_response", "system_prompt"
+        ])
+        if gemini_changed:
             if "gemini_voice" in changed_fields:
                 logger.info(f"  → Gemini voice: {config.gemini_voice}")
             if "gemini_model" in changed_fields:
                 logger.info(f"  → Gemini model: {config.gemini_model}")
+            if "gemini_thinking" in changed_fields:
+                logger.info(f"  → Gemini thinking: {config.gemini_thinking}")
+            if "gemini_google_search" in changed_fields:
+                logger.info(f"  → Gemini Google Search: {config.gemini_google_search}")
+            if "gemini_function_calling" in changed_fields:
+                logger.info(f"  → Gemini function calling: {config.gemini_function_calling}")
+            if "gemini_automatic_function_response" in changed_fields:
+                logger.info(f"  → Gemini automatic function response: {config.gemini_automatic_function_response}")
             # Need to reconnect Gemini with new settings
             asyncio.create_task(self._reconnect_gemini_with_new_config())
     
@@ -186,6 +210,10 @@ class VoiceHandler:
                 voice=self.config.gemini_voice,
                 system_instruction=getattr(self.config, 'system_prompt', None),
                 model=self.config.gemini_model,
+                thinking=self.config.gemini_thinking,
+                google_search=self.config.gemini_google_search,
+                function_calling=self.config.gemini_function_calling,
+                automatic_function_response=self.config.gemini_automatic_function_response,
             )
             
             # Reconnect if we're in a voice channel
@@ -448,6 +476,13 @@ class VoiceHandler:
         await self._gemini.stop_health_check()
         await self._gemini.disconnect()
         
+        # Remove config change listener to prevent memory leak
+        self.config.remove_change_listener(self._on_config_changed)
+        logger.debug("Removed config change listener")
+        
+        # Clean up all user resources
+        self._cleanup_all_users()
+        
         # Disconnect from voice
         if self._voice_client:
             try:
@@ -528,13 +563,16 @@ class VoiceHandler:
         self._capture_task = asyncio.create_task(self._run_streaming_pipeline())
     
     async def _run_streaming_pipeline(self) -> None:
-        """Run the full streaming pipeline with concurrent send/receive.
+        """Run the full streaming pipeline with sequential send then receive.
         
         This method:
-        1. Starts streaming audio to Gemini immediately
-        2. Starts receiving and playing responses concurrently
-        3. Uses VAD to detect end of speech instead of fixed duration
-        4. Plays audio as soon as first chunk arrives from Gemini
+        1. Captures and sends user audio to Gemini until speech ends
+        2. Signals end_turn() to tell Gemini user is done speaking
+        3. Receives and plays Gemini's audio response
+        
+        IMPORTANT: We use sequential (not concurrent) send/receive because
+        Gemini may send turn_complete prematurely if we start receiving
+        before sending end_turn(). This caused 0 audio chunks to be received.
         """
         try:
             import time
@@ -560,25 +598,37 @@ class VoiceHandler:
             # Start streaming mode in capture (enables direct queue pushing)
             self._capture.start_streaming_to_gemini()
             
-            # Transition to speaking state early - we'll start playing as chunks arrive
-            await self._set_state(BotState.SPEAKING)
+            # Transition to processing state while capturing user speech
+            await self._set_state(BotState.PROCESSING)
             
-            # Start streaming playback (will play silence until chunks arrive)
+            # IMPORTANT: Sequential pipeline - send first, then receive
+            # Gemini sends turn_complete when it thinks user is done speaking.
+            # If we start receiving before calling end_turn(), Gemini may send
+            # turn_complete prematurely with 0 audio chunks.
+            
+            # Phase 1: Capture and send all user audio
+            self._send_task = asyncio.create_task(self._send_audio_loop())
+            try:
+                await self._send_task
+            except Exception as e:
+                logger.error(f"Error in send loop: {e}")
+            
+            # Phase 2: Start streaming playback (will buffer until chunks arrive)
             playback_started = self._playback.start_streaming_playback()
             if not playback_started:
                 logger.error("Failed to start streaming playback")
                 await self._reset_to_listening()
                 return
             
-            # Start concurrent tasks
-            self._send_task = asyncio.create_task(self._send_audio_loop())
-            self._receive_task = asyncio.create_task(self._receive_response_loop())
+            # Transition to speaking state now that we're receiving
+            await self._set_state(BotState.SPEAKING)
             
-            # Wait for both to complete
+            # Phase 3: Receive and play Gemini's response
+            self._receive_task = asyncio.create_task(self._receive_response_loop())
             try:
-                await asyncio.gather(self._send_task, self._receive_task)
+                await self._receive_task
             except Exception as e:
-                logger.error(f"Error in streaming pipeline: {e}")
+                logger.error(f"Error in receive loop: {e}")
             
             # Cleanup
             self._is_capturing_for_gemini = False
@@ -606,13 +656,13 @@ class VoiceHandler:
     async def _send_audio_loop(self) -> None:
         """Send audio to Gemini in real-time from the streaming queue.
         
-        This runs concurrently with receive, so response can start playing
-        while user is still speaking.
+        Captures user audio and sends to Gemini until one of:
+        1. VAD detects silence after speech
+        2. No audio chunks received for 300ms (user stopped)
+        3. Max capture duration reached
         
-        Uses multiple end-of-speech detection strategies:
-        1. VAD silence detection (speech followed by silence frames)
-        2. No-chunk timeout (Discord stops sending when user is quiet)
-        3. Max capture duration (safety limit)
+        After completion, calls end_turn() to signal Gemini that
+        the user has finished speaking and a response is expected.
         """
         import time
         
@@ -626,7 +676,7 @@ class VoiceHandler:
         last_chunk_time = time.time()
         received_at_least_one_chunk = False
         
-        logger.debug(f"📤 Starting audio send loop (max {max_duration}s, no-chunk timeout {no_chunk_timeout}s)")
+        logger.debug(f"📤 Starting audio send loop (max {max_duration}s, no-chunk timeout {no_chunk_timeout}s, min speech 1.0s)")
         
         try:
             while self._is_capturing_for_gemini:
@@ -684,8 +734,8 @@ class VoiceHandler:
     async def _receive_response_loop(self) -> None:
         """Receive audio from Gemini and stream to playback immediately.
         
-        This runs concurrently with send, so response starts playing
-        as soon as the first chunk arrives.
+        Includes a timeout to prevent indefinite blocking if Gemini
+        doesn't respond.
         """
         import time
         
@@ -695,22 +745,36 @@ class VoiceHandler:
         total_bytes = 0
         first_chunk_time = None
         
-        try:
-            async for audio_chunk in self._gemini.receive_responses():
-                if first_chunk_time is None:
-                    first_chunk_time = time.time()
-                    latency = first_chunk_time - receive_start
-                    logger.info(f"🔊 First audio chunk received in {latency:.3f}s - starting playback!")
-                
-                chunk_count += 1
-                total_bytes += len(audio_chunk)
-                
-                # Add chunk to streaming playback immediately
-                self._playback.add_streaming_chunk(audio_chunk)
-                
-                if chunk_count % 10 == 0:
-                    logger.debug(f"🔊 Received {chunk_count} chunks ({total_bytes} bytes)")
+        # Timeout for receiving first chunk (Gemini should respond within 30s)
+        receive_timeout = 30.0
         
+        try:
+            # Wrap the receive in a timeout
+            async def receive_with_activity_check():
+                nonlocal chunk_count, total_bytes, first_chunk_time
+                last_activity = time.time()
+                
+                async for audio_chunk in self._gemini.receive_responses():
+                    last_activity = time.time()
+                    
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time()
+                        latency = first_chunk_time - receive_start
+                        logger.info(f"🔊 First audio chunk received in {latency:.3f}s - starting playback!")
+                    
+                    chunk_count += 1
+                    total_bytes += len(audio_chunk)
+                    
+                    # Add chunk to streaming playback immediately
+                    self._playback.add_streaming_chunk(audio_chunk)
+                    
+                    if chunk_count % 10 == 0:
+                        logger.debug(f"🔊 Received {chunk_count} chunks ({total_bytes} bytes)")
+            
+            await asyncio.wait_for(receive_with_activity_check(), timeout=receive_timeout)
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ Receive loop timed out after {receive_timeout}s (received {chunk_count} chunks)")
         except asyncio.CancelledError:
             logger.debug("Receive loop cancelled")
         except Exception as e:
@@ -772,6 +836,121 @@ class VoiceHandler:
         
         logger.info(f"Ready for next wake word '{self.config.wake_phrase_display}'")
     
+    async def process_text_prompt(self, prompt: str, user_id: int) -> bool:
+        """Process a text prompt from the /ask command and respond via voice.
+        
+        Args:
+            prompt: The text prompt to send to Gemini.
+            user_id: Discord user ID who sent the prompt.
+            
+        Returns:
+            True if processing started successfully, False otherwise.
+        """
+        if self._state != BotState.LISTENING:
+            logger.warning(f"Cannot process text prompt: not in LISTENING state (current: {self._state})")
+            return False
+        
+        logger.info(f"📝 Processing text prompt from user {user_id}: {prompt[:50]}...")
+        
+        try:
+            # Store which user triggered the command
+            self._triggered_user_id = user_id
+            
+            # Transition to processing state
+            await self._set_state(BotState.PROCESSING)
+            
+            # Disable wake word detection during processing
+            self._wake_detector.disable()
+            
+            # Clear any old buffer data
+            self._speech_buffer.clear()
+            self._capture.clear_buffer()
+            
+            # Start the text prompt processing pipeline
+            self._capture_task = asyncio.create_task(self._run_text_prompt_pipeline(prompt))
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error starting text prompt processing: {e}")
+            await self._reset_to_listening()
+            return False
+    
+    async def _run_text_prompt_pipeline(self, prompt: str) -> None:
+        """Run the text prompt processing pipeline.
+        
+        This method:
+        1. Sends the text prompt to Gemini
+        2. Receives and plays the audio response
+        
+        Args:
+            prompt: The text prompt to send.
+        """
+        try:
+            logger.info("🚀 Starting text prompt pipeline")
+            
+            # Check if Gemini needs reconnection
+            if not self._gemini.is_connected:
+                logger.warning(f"Gemini not connected (state={self._gemini.state}), attempting reconnect...")
+                await self._gemini.disconnect()
+                if not await self._gemini.connect():
+                    logger.error("Failed to reconnect to Gemini")
+                    await self._reset_to_listening()
+                    return
+                logger.info("✓ Successfully reconnected to Gemini")
+            
+            # Initialize streaming state
+            self._streaming_complete.clear()
+            
+            # Transition to speaking state
+            await self._set_state(BotState.SPEAKING)
+            
+            # Start streaming playback (will play silence until chunks arrive)
+            playback_started = self._playback.start_streaming_playback()
+            if not playback_started:
+                logger.error("Failed to start streaming playback")
+                await self._reset_to_listening()
+                return
+            
+            # Send the text prompt and receive response concurrently
+            self._send_task = asyncio.create_task(self._send_text_prompt(prompt))
+            self._receive_task = asyncio.create_task(self._receive_response_loop())
+            
+            # Wait for both to complete
+            try:
+                await asyncio.gather(self._send_task, self._receive_task)
+            except Exception as e:
+                logger.error(f"Error in text prompt pipeline: {e}")
+            
+            # Wait for playback to complete
+            logger.debug("Waiting for playback to complete...")
+            await self._playback.wait_for_playback(timeout=60.0)
+            logger.info("✓ Text prompt pipeline complete")
+            
+            await self._reset_to_listening()
+            
+        except asyncio.CancelledError:
+            logger.debug("Text prompt pipeline cancelled")
+        except Exception as e:
+            logger.error(f"❌ Error in text prompt pipeline: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            await self._reset_to_listening()
+    
+    async def _send_text_prompt(self, prompt: str) -> None:
+        """Send the text prompt to Gemini.
+        
+        Args:
+            prompt: The text prompt to send.
+        """
+        try:
+            logger.debug(f"📤 Sending text prompt to Gemini: {prompt[:100]}...")
+            await self._gemini.send_text(prompt)
+            logger.info("📤 Text prompt sent successfully")
+        except Exception as e:
+            logger.error(f"Error sending text prompt: {e}")
+            self._streaming_complete.set()
+    
     async def handle_audio_packet(
         self,
         user: discord.User,
@@ -788,3 +967,43 @@ class VoiceHandler:
         logger.debug(f"Received audio packet from {user.name}: {len(audio_data)} bytes")
         # Process audio through capture pipeline
         await self._capture.process_discord_audio(audio_data, is_stereo=True)
+    
+    def cleanup_user(self, user_id: int) -> None:
+        """Clean up resources for a user who left the voice channel.
+        
+        This frees audio buffers and wake word models for the user.
+        
+        Args:
+            user_id: Discord user ID to clean up.
+        """
+        logger.info(f"Cleaning up resources for user {user_id}")
+        
+        # Clean up audio capture buffers
+        self._capture.cleanup_user(user_id)
+        
+        # Clean up wake word detector models
+        self._wake_detector.cleanup_user(user_id)
+        
+        # Clean up sink tracking if available
+        if self._sink and hasattr(self._sink, '_per_user_chunk_count'):
+            if user_id in self._sink._per_user_chunk_count:
+                del self._sink._per_user_chunk_count[user_id]
+        
+        logger.debug(f"Completed cleanup for user {user_id}")
+    
+    def _cleanup_all_users(self) -> None:
+        """Clean up resources for all users.
+        
+        Called when leaving the voice channel to free all user resources.
+        """
+        # Get list of all users from capture
+        user_ids = self._capture.get_active_users()
+        detector_users = self._wake_detector.get_active_users()
+        
+        # Combine and deduplicate
+        all_users = set(user_ids) | set(detector_users)
+        
+        for user_id in all_users:
+            self.cleanup_user(user_id)
+        
+        logger.info(f"Cleaned up resources for {len(all_users)} users")
