@@ -73,12 +73,13 @@ class StreamingPCMSource(discord.AudioSource):
     # Discord expects 20ms frames of stereo 48kHz 16-bit audio
     FRAME_SIZE = 3840  # 48000 * 2 bytes * 2 channels * 0.02 seconds
     
-    def __init__(self, processor: AudioProcessor, volume: float = 1.0):
+    def __init__(self, processor: AudioProcessor, volume: float = 1.0, buffer_ms: int = 200):
         """Initialize the streaming audio source.
         
         Args:
             processor: AudioProcessor for format conversion.
             volume: Volume multiplier (0.0 to 2.0).
+            buffer_ms: Milliseconds of audio to buffer before starting playback.
         """
         self._processor = processor
         self._volume = volume
@@ -86,6 +87,13 @@ class StreamingPCMSource(discord.AudioSource):
         self._chunk_queue: deque[bytes] = deque()
         self._is_finished = False
         self._lock = asyncio.Lock()
+        
+        # Buffer threshold: calculate bytes needed for buffer_ms at Discord's format
+        # 48kHz * 2 bytes per sample * 2 channels = 192000 bytes per second
+        bytes_per_ms = 48000 * 2 * 2 // 1000
+        self._buffer_threshold = buffer_ms * bytes_per_ms
+        self._buffering = True  # Start in buffering mode
+        logger.debug(f"StreamingPCMSource initialized with {buffer_ms}ms buffer ({self._buffer_threshold} bytes)")
     
     def add_chunk(self, gemini_audio: bytes) -> None:
         """Add a chunk of Gemini audio to the playback queue.
@@ -100,6 +108,13 @@ class StreamingPCMSource(discord.AudioSource):
     def mark_finished(self) -> None:
         """Mark that no more chunks will be added."""
         self._is_finished = True
+        # Stop buffering when finished, even if threshold not reached
+        self._buffering = False
+    
+    def _get_total_buffered(self) -> int:
+        """Get total bytes currently buffered (buffer + queue)."""
+        queue_bytes = sum(len(chunk) for chunk in self._chunk_queue)
+        return len(self._buffer) + queue_bytes
     
     def read(self) -> bytes:
         """Read the next frame of audio.
@@ -107,6 +122,16 @@ class StreamingPCMSource(discord.AudioSource):
         Returns:
             20ms of audio data, or empty bytes if finished.
         """
+        # Check if we're still buffering
+        if self._buffering:
+            total_buffered = self._get_total_buffered()
+            if total_buffered >= self._buffer_threshold:
+                self._buffering = False
+                logger.debug(f"Buffer threshold reached ({total_buffered} bytes), starting playback")
+            else:
+                # Still buffering - return silence
+                return b"\x00" * self.FRAME_SIZE
+        
         # Fill buffer from queue if needed
         while len(self._buffer) < self.FRAME_SIZE and self._chunk_queue:
             chunk = self._chunk_queue.popleft()
@@ -149,15 +174,18 @@ class AudioPlayback:
         self,
         processor: AudioProcessor,
         volume: float = 1.0,
+        buffer_ms: int = 200,
     ):
         """Initialize the audio playback.
         
         Args:
             processor: AudioProcessor instance for format conversion.
             volume: Default volume (0.0 to 2.0).
+            buffer_ms: Milliseconds of audio to buffer before starting playback.
         """
         self.processor = processor
         self.volume = volume
+        self.buffer_ms = buffer_ms
         
         self._voice_client: Optional[discord.VoiceClient] = None
         self._is_playing = False
@@ -276,8 +304,10 @@ class AudioPlayback:
             logger.debug("Stopping current playback for streaming")
             self._voice_client.stop()
         
-        # Create streaming source
-        self._streaming_source = StreamingPCMSource(self.processor, volume=self.volume)
+        # Create streaming source with buffer delay
+        self._streaming_source = StreamingPCMSource(
+            self.processor, volume=self.volume, buffer_ms=self.buffer_ms
+        )
         
         # Set up completion tracking
         self._is_playing = True
