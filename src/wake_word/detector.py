@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import threading
 from typing import Optional, Callable, Awaitable, Dict, Tuple
 import numpy as np
 
@@ -75,6 +76,10 @@ class WakeWordDetector:
         self._user_models: Dict[int, object] = {}
         self._user_process_counts: Dict[int, int] = {}
         self._user_last_scores: Dict[int, dict] = {}
+        
+        # Per-user locks to prevent race conditions between predict() and reset()
+        self._user_locks: Dict[int, threading.Lock] = {}
+        self._user_locks_lock = threading.Lock()  # Lock for the locks dict itself
         
         # Pre-warmed models ready for new users
         self._prewarmed_models: list = []
@@ -192,6 +197,20 @@ class WakeWordDetector:
         
         return self._user_models[user_id]
     
+    def _get_user_lock(self, user_id: int) -> threading.Lock:
+        """Get or create a lock for a specific user.
+        
+        Args:
+            user_id: Discord user ID.
+            
+        Returns:
+            threading.Lock for this user.
+        """
+        with self._user_locks_lock:
+            if user_id not in self._user_locks:
+                self._user_locks[user_id] = threading.Lock()
+            return self._user_locks[user_id]
+    
     def set_detection_callback(
         self,
         callback: Optional[Callable[[int], Awaitable[None]]],
@@ -226,14 +245,19 @@ class WakeWordDetector:
         """
         if user_id is not None:
             if user_id in self._user_models:
-                self._user_models[user_id].reset()
-                self._user_process_counts[user_id] = 0
+                # Use lock to prevent race with predict()
+                lock = self._get_user_lock(user_id)
+                with lock:
+                    self._user_models[user_id].reset()
+                    self._user_process_counts[user_id] = 0
                 logger.debug(f"Reset wake word model for user {user_id}")
         else:
             # Reset all user models
             for uid, model in self._user_models.items():
-                model.reset()
-                self._user_process_counts[uid] = 0
+                lock = self._get_user_lock(uid)
+                with lock:
+                    model.reset()
+                    self._user_process_counts[uid] = 0
             if self._model:
                 self._model.reset()
             logger.debug("Reset all wake word models")
@@ -246,10 +270,15 @@ class WakeWordDetector:
         """
         if user_id in self._user_models:
             del self._user_models[user_id]
+        if user_id in self._user_process_counts:
             del self._user_process_counts[user_id]
-            if user_id in self._user_last_scores:
-                del self._user_last_scores[user_id]
-            logger.info(f"Cleaned up wake word model for user {user_id}")
+        if user_id in self._user_last_scores:
+            del self._user_last_scores[user_id]
+        # Clean up the lock too
+        with self._user_locks_lock:
+            if user_id in self._user_locks:
+                del self._user_locks[user_id]
+        logger.info(f"Cleaned up wake word model for user {user_id}")
     
     async def process_audio_for_user(self, audio_data: bytes, user_id: int) -> bool:
         """Process audio chunk for a specific user and check for wake word.
@@ -269,6 +298,13 @@ class WakeWordDetector:
         if not self._is_enabled:
             return False
         
+        # Validate audio data - OpenWakeWord ONNX model requires minimum 16 samples
+        # Each sample is 2 bytes (16-bit), so minimum 32 bytes needed
+        MIN_AUDIO_BYTES = 32  # 16 samples * 2 bytes per sample
+        if not audio_data or len(audio_data) < MIN_AUDIO_BYTES:
+            logger.debug(f"Skipping audio chunk for user {user_id}: too small ({len(audio_data) if audio_data else 0} bytes, need {MIN_AUDIO_BYTES})")
+            return False
+        
         # Get or create user-specific model
         model = self._get_or_create_user_model(user_id)
         if model is None:
@@ -279,12 +315,24 @@ class WakeWordDetector:
         # Convert bytes to numpy array
         audio_np = np.frombuffer(audio_data, dtype=np.int16)
         
+        # Verify we have enough samples after conversion
+        if len(audio_np) < 16:
+            logger.debug(f"Skipping audio chunk for user {user_id}: insufficient samples ({len(audio_np)})")
+            return False
+        
         # Run prediction in thread executor to avoid blocking event loop
         # This is CPU-bound work that can take several milliseconds
+        # Use per-user lock to prevent race with reset()
+        lock = self._get_user_lock(user_id)
+        
+        def predict_with_lock():
+            with lock:
+                return model.predict(audio_np)
+        
         loop = asyncio.get_event_loop()
         executor = _get_inference_executor()
         try:
-            prediction = await loop.run_in_executor(executor, model.predict, audio_np)
+            prediction = await loop.run_in_executor(executor, predict_with_lock)
         except Exception as e:
             logger.error(f"Error running wake word prediction for user {user_id}: {e}")
             return False
@@ -319,10 +367,19 @@ class WakeWordDetector:
         if not self._is_enabled or not self._model:
             return False
         
+        # Validate audio data - OpenWakeWord ONNX model requires minimum 16 samples
+        MIN_AUDIO_BYTES = 32  # 16 samples * 2 bytes per sample
+        if not audio_data or len(audio_data) < MIN_AUDIO_BYTES:
+            return False
+        
         self._process_count += 1
         
         # Convert bytes to numpy array
         audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        
+        # Verify we have enough samples after conversion
+        if len(audio_np) < 16:
+            return False
         
         # Run prediction (this is CPU-bound, but fast)
         prediction = self._model.predict(audio_np)
@@ -358,10 +415,19 @@ class WakeWordDetector:
         if not self._is_enabled or not self._model:
             return False
         
+        # Validate audio data - OpenWakeWord ONNX model requires minimum 16 samples
+        MIN_AUDIO_BYTES = 32  # 16 samples * 2 bytes per sample
+        if not audio_data or len(audio_data) < MIN_AUDIO_BYTES:
+            return False
+        
         self._process_count += 1
         
         # Convert bytes to numpy array
         audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        
+        # Verify we have enough samples after conversion
+        if len(audio_np) < 16:
+            return False
         
         # Run prediction
         prediction = self._model.predict(audio_np)
