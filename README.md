@@ -6,6 +6,9 @@ A Discord-based AI voice assistant that joins voice channels and responds to voi
 
 - **Wake Word Detection**: Listens for configurable wake phrase (default: "hey jarvis") using OpenWakeWord
 - **Real-time Voice AI**: Uses Gemini Live API for low-latency speech-to-speech interaction
+- **Text Prompts**: Send text prompts directly with `/ask` command - no wake word needed
+- **Smart Queue System**: Queues `/ask` commands when busy, with priority over voice detection
+- **Response Controls**: Stop, pause, and continue responses mid-playback
 - **Modular Design**: Easily swap wake words, voices, and AI models
 - **Single Request Processing**: Handles one user at a time to prevent overlapping responses
 
@@ -66,9 +69,21 @@ python -m src.main
 
 ## Bot Commands
 
-- `/join` - Bot joins your current voice channel
-- `/leave` - Bot leaves the voice channel
-- `/status` - Check bot status and current settings
+### Core Commands
+| Command | Description |
+|---------|-------------|
+| `/join` | 🔊 Bot joins your current voice channel |
+| `/leave` | 👋 Bot leaves the voice channel |
+| `/status` | 📊 Check bot status and current settings |
+| `/ask <prompt>` | 💬 Send a text prompt to the bot (queued if busy) |
+| `/queue` | 📋 View pending prompts in the queue |
+
+### Response Controls
+| Command | Description |
+|---------|-------------|
+| `/stop` | 🛑 Stop the current response and return to listening |
+| `/pause` | ⏸️ Pause the current response |
+| `/continue` | ▶️ Resume a paused response |
 
 ## Configuration
 
