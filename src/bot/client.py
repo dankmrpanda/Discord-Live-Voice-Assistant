@@ -82,6 +82,11 @@ class DiscordBot(commands.Bot):
                     BotState.SPEAKING: "Speaking response",
                 }
                 state_msg = state_messages.get(handler.state, "Unknown")
+                
+                # Add pause indicator if paused
+                if handler.state == BotState.SPEAKING and handler.is_response_paused:
+                    state_msg += " ⏸️ (paused)"
+                
                 status = f"**Status:** {state_msg}"
             
             embed = discord.Embed(
@@ -91,6 +96,11 @@ class DiscordBot(commands.Bot):
             )
             embed.add_field(name="Wake Phrase", value=f"`{self.config.wake_phrase_display}`", inline=True)
             embed.add_field(name="Voice", value=self.config.gemini_voice, inline=True)
+            
+            # Add queue info if connected
+            if handler and handler.state != BotState.IDLE:
+                queue_size = handler.get_queue_size()
+                embed.add_field(name="Queue", value=f"{queue_size} prompt(s)", inline=True)
             
             await ctx.respond(embed=embed)
         
@@ -207,7 +217,105 @@ class DiscordBot(commands.Bot):
             
             await ctx.respond(embed=embed)
         
-        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue")
+        @self.slash_command(name="stop", description="Stop the bot's current response")
+        async def stop_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to stop the bot's response."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond(
+                    "I'm not connected to a voice channel.",
+                    ephemeral=True,
+                )
+                return
+            
+            if handler.state != BotState.SPEAKING:
+                await ctx.respond(
+                    "I'm not currently speaking.",
+                    ephemeral=True,
+                )
+                return
+            
+            success = await handler.stop_response()
+            if success:
+                await ctx.respond("🛑 Response stopped.")
+            else:
+                await ctx.respond(
+                    "Failed to stop the response.",
+                    ephemeral=True,
+                )
+        
+        @self.slash_command(name="pause", description="Pause the bot's current response")
+        async def pause_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to pause the bot's response."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond(
+                    "I'm not connected to a voice channel.",
+                    ephemeral=True,
+                )
+                return
+            
+            if handler.state != BotState.SPEAKING:
+                await ctx.respond(
+                    "I'm not currently speaking.",
+                    ephemeral=True,
+                )
+                return
+            
+            if handler.is_response_paused:
+                await ctx.respond(
+                    "Response is already paused. Use `/continue` to resume.",
+                    ephemeral=True,
+                )
+                return
+            
+            success = handler.pause_response()
+            if success:
+                await ctx.respond("⏸️ Response paused. Use `/continue` to resume.")
+            else:
+                await ctx.respond(
+                    "Failed to pause the response.",
+                    ephemeral=True,
+                )
+        
+        @self.slash_command(name="continue", description="Continue the bot's paused response")
+        async def continue_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to continue the bot's paused response."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond(
+                    "I'm not connected to a voice channel.",
+                    ephemeral=True,
+                )
+                return
+            
+            if handler.state != BotState.SPEAKING:
+                await ctx.respond(
+                    "I'm not currently speaking.",
+                    ephemeral=True,
+                )
+                return
+            
+            if not handler.is_response_paused:
+                await ctx.respond(
+                    "Response is not paused.",
+                    ephemeral=True,
+                )
+                return
+            
+            success = handler.resume_response()
+            if success:
+                await ctx.respond("▶️ Response resumed.")
+            else:
+                await ctx.respond(
+                    "Failed to resume the response.",
+                    ephemeral=True,
+                )
+        
+        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue, /stop, /pause, /continue")
     
     async def on_ready(self) -> None:
         """Handle bot ready event."""

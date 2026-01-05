@@ -946,6 +946,78 @@ class VoiceHandler:
         # Access the internal deque to peek at items without consuming them
         return list(self._ask_queue._queue)
     
+    async def stop_response(self) -> bool:
+        """Stop the current response and reset to listening state.
+        
+        This cancels the receive task and stops playback immediately.
+        
+        Returns:
+            True if stopped successfully, False if not speaking.
+        """
+        if self._state != BotState.SPEAKING:
+            logger.warning(f"Cannot stop response: not in SPEAKING state (current: {self._state})")
+            return False
+        
+        logger.info("🛑 Stopping response")
+        
+        # Cancel the receive task if running
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+            self._receive_task = None
+        
+        # Stop the playback
+        self._playback.stop()
+        
+        # Mark streaming as complete
+        self._streaming_complete.set()
+        
+        # Reset to listening state
+        await self._reset_to_listening()
+        
+        logger.info("✓ Response stopped, returning to listening")
+        return True
+    
+    def pause_response(self) -> bool:
+        """Pause the current response playback.
+        
+        Returns:
+            True if paused successfully, False if not speaking or already paused.
+        """
+        if self._state != BotState.SPEAKING:
+            logger.warning(f"Cannot pause response: not in SPEAKING state (current: {self._state})")
+            return False
+        
+        if self._playback.is_paused:
+            logger.debug("Response already paused")
+            return False
+        
+        return self._playback.pause()
+    
+    def resume_response(self) -> bool:
+        """Resume the paused response playback.
+        
+        Returns:
+            True if resumed successfully, False if not speaking or not paused.
+        """
+        if self._state != BotState.SPEAKING:
+            logger.warning(f"Cannot resume response: not in SPEAKING state (current: {self._state})")
+            return False
+        
+        if not self._playback.is_paused:
+            logger.debug("Response is not paused")
+            return False
+        
+        return self._playback.resume()
+    
+    @property
+    def is_response_paused(self) -> bool:
+        """Check if the current response is paused."""
+        return self._state == BotState.SPEAKING and self._playback.is_paused
+    
     async def _run_text_prompt_pipeline(self, prompt: str) -> None:
         """Run the text prompt processing pipeline.
         

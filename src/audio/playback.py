@@ -93,6 +93,7 @@ class StreamingPCMSource(discord.AudioSource):
         bytes_per_ms = 48000 * 2 * 2 // 1000
         self._buffer_threshold = buffer_ms * bytes_per_ms
         self._buffering = True  # Start in buffering mode
+        self._paused = False  # Pause state for response control
         logger.debug(f"StreamingPCMSource initialized with {buffer_ms}ms buffer ({self._buffer_threshold} bytes)")
     
     def add_chunk(self, gemini_audio: bytes) -> None:
@@ -116,12 +117,31 @@ class StreamingPCMSource(discord.AudioSource):
         queue_bytes = sum(len(chunk) for chunk in self._chunk_queue)
         return len(self._buffer) + queue_bytes
     
+    def pause(self) -> None:
+        """Pause audio playback (returns silence instead of buffered audio)."""
+        self._paused = True
+        logger.debug("StreamingPCMSource paused")
+    
+    def resume(self) -> None:
+        """Resume audio playback."""
+        self._paused = False
+        logger.debug("StreamingPCMSource resumed")
+    
+    @property
+    def is_paused(self) -> bool:
+        """Check if playback is paused."""
+        return self._paused
+    
     def read(self) -> bytes:
         """Read the next frame of audio.
         
         Returns:
             20ms of audio data, or empty bytes if finished.
         """
+        # If paused, return silence to keep stream alive but not play audio
+        if self._paused:
+            return b"\x00" * self.FRAME_SIZE
+        
         # Check if we're still buffering
         if self._buffering:
             total_buffered = self._get_total_buffered()
@@ -356,3 +376,38 @@ class AudioPlayback:
     def is_streaming(self) -> bool:
         """Check if currently in streaming playback mode."""
         return self._is_streaming
+    
+    def pause(self) -> bool:
+        """Pause streaming playback.
+        
+        Returns:
+            True if paused successfully, False if not in streaming mode.
+        """
+        if not self._streaming_source or not self._is_streaming:
+            logger.warning("Cannot pause: not in streaming mode")
+            return False
+        
+        self._streaming_source.pause()
+        logger.info("⏸️ Playback paused")
+        return True
+    
+    def resume(self) -> bool:
+        """Resume streaming playback.
+        
+        Returns:
+            True if resumed successfully, False if not in streaming mode.
+        """
+        if not self._streaming_source or not self._is_streaming:
+            logger.warning("Cannot resume: not in streaming mode")
+            return False
+        
+        self._streaming_source.resume()
+        logger.info("▶️ Playback resumed")
+        return True
+    
+    @property
+    def is_paused(self) -> bool:
+        """Check if playback is currently paused."""
+        if not self._streaming_source:
+            return False
+        return self._streaming_source.is_paused
