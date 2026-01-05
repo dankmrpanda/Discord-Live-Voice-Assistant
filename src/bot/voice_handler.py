@@ -123,6 +123,9 @@ class VoiceHandler:
         self._receive_task: Optional[asyncio.Task] = None
         self._streaming_complete = asyncio.Event()
         
+        # Queue for /ask commands (prompt, user_id)
+        self._ask_queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        
         # Set up callbacks
         self._setup_callbacks()
         
@@ -422,6 +425,16 @@ class VoiceHandler:
     async def leave_channel(self) -> None:
         """Leave the current voice channel and clean up resources."""
         logger.info("Leaving voice channel")
+        
+        # Clear the /ask queue on leave
+        queue_size = self._ask_queue.qsize()
+        if queue_size > 0:
+            logger.info(f"Clearing /ask queue ({queue_size} items)")
+            while not self._ask_queue.empty():
+                try:
+                    self._ask_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
         
         # Stop recording first (before disabling other components)
         if self._voice_client and self._voice_client.recording:
@@ -810,7 +823,11 @@ class VoiceHandler:
         logger.debug("Playback complete callback triggered")
     
     async def _reset_to_listening(self) -> None:
-        """Reset to listening state after processing/speaking."""
+        """Reset to listening state after processing/speaking.
+        
+        Checks the /ask queue first (higher priority than wake word).
+        If there are queued prompts, processes them before resuming wake word detection.
+        """
         if self._state == BotState.IDLE:
             return
         
@@ -827,7 +844,25 @@ class VoiceHandler:
         self._speech_buffer.clear()
         self._capture.clear_buffer()
         
-        # Re-enable wake word detection
+        # Check /ask queue first (higher priority than wake word)
+        if not self._ask_queue.empty():
+            try:
+                prompt, user_id = self._ask_queue.get_nowait()
+                remaining = self._ask_queue.qsize()
+                logger.info(f"📋 Processing queued /ask prompt from user {user_id} ({remaining} remaining in queue)")
+                
+                # Process the queued prompt directly (don't call process_text_prompt to avoid redundant state checks)
+                self._triggered_user_id = user_id
+                await self._set_state(BotState.PROCESSING)
+                self._wake_detector.disable()
+                self._speech_buffer.clear()
+                self._capture.clear_buffer()
+                self._capture_task = asyncio.create_task(self._run_text_prompt_pipeline(prompt))
+                return
+            except asyncio.QueueEmpty:
+                pass  # Queue was emptied between check and get, continue to wake word
+        
+        # No queued prompts, re-enable wake word detection
         self._wake_detector.enable()
         self._wake_detector.reset()
         
@@ -875,6 +910,41 @@ class VoiceHandler:
             logger.error(f"Error starting text prompt processing: {e}")
             await self._reset_to_listening()
             return False
+    
+    def queue_text_prompt(self, prompt: str, user_id: int) -> int:
+        """Queue a text prompt to be processed after the current request.
+        
+        This is called when the bot is busy processing another request.
+        The queued prompt will be processed with higher priority than wake word detection.
+        
+        Args:
+            prompt: The text prompt to queue.
+            user_id: Discord user ID who sent the prompt.
+            
+        Returns:
+            Position in queue (1-indexed).
+        """
+        self._ask_queue.put_nowait((prompt, user_id))
+        position = self._ask_queue.qsize()
+        logger.info(f"📋 Queued /ask prompt from user {user_id} at position #{position}: {prompt[:50]}...")
+        return position
+    
+    def get_queue_size(self) -> int:
+        """Get the number of items in the /ask queue.
+        
+        Returns:
+            Number of queued prompts.
+        """
+        return self._ask_queue.qsize()
+    
+    def get_queue_items(self) -> list[tuple[str, int]]:
+        """Get all items in the /ask queue without removing them.
+        
+        Returns:
+            List of (prompt, user_id) tuples in queue order.
+        """
+        # Access the internal deque to peek at items without consuming them
+        return list(self._ask_queue._queue)
     
     async def _run_text_prompt_pipeline(self, prompt: str) -> None:
         """Run the text prompt processing pipeline.

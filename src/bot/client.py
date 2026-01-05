@@ -110,11 +110,13 @@ class DiscordBot(commands.Bot):
                 )
                 return
             
-            # Check if bot is currently busy
+            # Check if bot is currently busy - queue the prompt instead of rejecting
             if handler.state in (BotState.PROCESSING, BotState.SPEAKING):
+                # Queue the prompt for later processing
+                position = handler.queue_text_prompt(prompt, ctx.author.id)
                 await ctx.respond(
-                    "I'm currently busy processing another request. Please wait a moment.",
-                    ephemeral=True,
+                    f"📋 I'm currently busy. Your prompt has been queued at **position #{position}**. "
+                    f"It will be processed automatically after the current request finishes.",
                 )
                 return
             
@@ -164,7 +166,48 @@ class DiscordBot(commands.Bot):
                     ephemeral=True,
                 )
         
-        logger.debug("Slash commands registered: /join, /leave, /status, /ask")
+        @self.slash_command(name="queue", description="View the current /ask prompt queue")
+        async def queue_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to view the current prompt queue."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            
+            # Check if bot is connected
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond(
+                    "I'm not connected to a voice channel.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Get queue items
+            queue_items = handler.get_queue_items()
+            
+            if not queue_items:
+                await ctx.respond(
+                    "📋 The prompt queue is empty.",
+                    ephemeral=True,
+                )
+                return
+            
+            # Build queue display
+            embed = discord.Embed(
+                title="📋 Prompt Queue",
+                description=f"**{len(queue_items)}** prompt(s) waiting to be processed:",
+                color=discord.Color.blue(),
+            )
+            
+            for i, (prompt, user_id) in enumerate(queue_items, 1):
+                # Truncate prompt for display
+                display_prompt = prompt[:80] + "..." if len(prompt) > 80 else prompt
+                embed.add_field(
+                    name=f"#{i}",
+                    value=f"<@{user_id}>: *{display_prompt}*",
+                    inline=False,
+                )
+            
+            await ctx.respond(embed=embed)
+        
+        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue")
     
     async def on_ready(self) -> None:
         """Handle bot ready event."""

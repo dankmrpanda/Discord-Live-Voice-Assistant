@@ -23,7 +23,7 @@ wake_word:
   # Lower = more sensitive (may have false positives)
   # Higher = less sensitive (may miss some activations)
   # Recommended: 0.5 for normal use, 0.3 for quiet environments
-  threshold: 0.5
+  threshold: 0.3
 
 # ------------------------------------------------------------
 # Voice Settings (Gemini TTS)
@@ -87,12 +87,12 @@ behavior:
   # With VAD (voice activity detection), capture will end early when
   # silence is detected, so this is just a safety limit.
   # Increase if your questions get cut off
-  capture_duration: 10.0
+  capture_duration: 7.0
   
   # Seconds of silence before ending capture (used by VAD)
   # Lower = faster response after you stop speaking
   # Higher = more tolerance for pauses mid-sentence
-  silence_threshold: 0.5
+  silence_threshold: 1.0
 
 # ------------------------------------------------------------
 # System Prompt
