@@ -947,18 +947,42 @@ class VoiceHandler:
         return list(self._ask_queue._queue)
     
     async def stop_response(self) -> bool:
-        """Stop the current response and reset to listening state.
+        """Stop the current request and reset to listening state.
         
-        This cancels the receive task and stops playback immediately.
+        This cancels all active tasks (capture, send, receive) and stops
+        playback immediately. Then processes the next queued prompt or
+        returns to listening for wake word.
         
         Returns:
-            True if stopped successfully, False if not speaking.
+            True if stopped successfully, False if not processing or speaking.
         """
-        if self._state != BotState.SPEAKING:
-            logger.warning(f"Cannot stop response: not in SPEAKING state (current: {self._state})")
+        if self._state not in (BotState.PROCESSING, BotState.SPEAKING):
+            logger.warning(f"Cannot stop response: not in PROCESSING or SPEAKING state (current: {self._state})")
             return False
         
-        logger.info("🛑 Stopping response")
+        logger.info("🛑 Stopping current request")
+        
+        # Stop streaming mode and reset capture state
+        self._is_capturing_for_gemini = False
+        self._capture.stop_streaming_to_gemini()
+        
+        # Cancel the capture task if running (manages the streaming pipeline)
+        if self._capture_task:
+            self._capture_task.cancel()
+            try:
+                await self._capture_task
+            except asyncio.CancelledError:
+                pass
+            self._capture_task = None
+        
+        # Cancel the send task if running
+        if self._send_task:
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
+            self._send_task = None
         
         # Cancel the receive task if running
         if self._receive_task:
@@ -975,10 +999,10 @@ class VoiceHandler:
         # Mark streaming as complete
         self._streaming_complete.set()
         
-        # Reset to listening state
+        # Reset to listening state (will process next queued prompt if any)
         await self._reset_to_listening()
         
-        logger.info("✓ Response stopped, returning to listening")
+        logger.info("✓ Request stopped, moving to next prompt or listening")
         return True
     
     def pause_response(self) -> bool:

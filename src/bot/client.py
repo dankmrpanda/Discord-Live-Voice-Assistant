@@ -217,9 +217,9 @@ class DiscordBot(commands.Bot):
             
             await ctx.respond(embed=embed)
         
-        @self.slash_command(name="stop", description="Stop the bot's current response")
+        @self.slash_command(name="stop", description="Stop the current request and move to the next in queue")
         async def stop_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to stop the bot's response."""
+            """Slash command to stop the current request."""
             handler = self.get_voice_handler(ctx.guild_id)
             
             if not handler or handler.state == BotState.IDLE:
@@ -229,19 +229,23 @@ class DiscordBot(commands.Bot):
                 )
                 return
             
-            if handler.state != BotState.SPEAKING:
+            if handler.state not in (BotState.PROCESSING, BotState.SPEAKING):
                 await ctx.respond(
-                    "I'm not currently speaking.",
+                    "I'm not currently processing or speaking.",
                     ephemeral=True,
                 )
                 return
             
             success = await handler.stop_response()
             if success:
-                await ctx.respond("🛑 Response stopped.")
+                queue_size = handler.get_queue_size()
+                if queue_size > 0:
+                    await ctx.respond(f"🛑 Request stopped. Processing next prompt in queue ({queue_size} remaining).")
+                else:
+                    await ctx.respond("🛑 Request stopped. Listening for wake word.")
             else:
                 await ctx.respond(
-                    "Failed to stop the response.",
+                    "Failed to stop the request.",
                     ephemeral=True,
                 )
         
