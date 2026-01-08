@@ -416,7 +416,7 @@ discord-live-vc-bot/
 
 ## 📝 License
 
-MIT License — See [LICENSE](LICENSE) for details.
+MIT License — See [LICENSE](LICENSE.txt) for details.
 
 ---
 
