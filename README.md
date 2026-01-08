@@ -1,13 +1,17 @@
-# Discord Live Voice Assistant
+# 🤖 J.A.R.V.I.S.
 
 <div align="center">
 
-**A real-time AI voice assistant for Discord voice channels powered by Google Gemini Live API**
+### *"Just A Rather Very Intelligent System"*
+
+**A real-time AI voice assistant for Discord — inspired by Tony Stark's legendary AI companion**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Discord.py](https://img.shields.io/badge/discord-py--cord-5865F2.svg)](https://pycord.dev/)
 [![Gemini](https://img.shields.io/badge/AI-Gemini%20Live-4285F4.svg)](https://ai.google.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+*"Good evening, sir. I've prepared the voice channel for your arrival."*
 
 </div>
 
@@ -16,7 +20,7 @@
 ## ✨ Features
 
 ### 🎤 Voice Interaction
-- **Wake Word Detection** — Activate the bot hands-free using customizable wake phrases powered by [OpenWakeWord](https://github.com/dscripka/openWakeWord)
+- **"Hey Jarvis" Wake Word** — Activate with the iconic wake phrase, powered by [OpenWakeWord](https://github.com/dscripka/openWakeWord)
 - **Real-Time Speech-to-Speech** — Low-latency voice conversations using Gemini Live API's bidirectional audio streaming
 - **Multi-User Support** — Per-user audio processing and wake word detection, even with 3+ users in the channel
 - **Voice Activity Detection (VAD)** — Intelligent speech detection with configurable silence thresholds
@@ -34,7 +38,7 @@
 ### ⚡ Advanced Capabilities
 - **Thinking Mode** — Enhanced reasoning with Gemini's internal thought process
 - **Google Search Grounding** — Real-time web search for current information
-- **Function Calling** — Extensible tool support (framework ready)
+- **Function Calling** — Extensible tool support (framework ready for your custom tools)
 - **Hot Reload** — Configuration changes apply without restart
 
 ### 🐳 Deployment Options
@@ -98,7 +102,7 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the bot
+# Run Jarvis
 python -m src.main
 ```
 
@@ -108,7 +112,7 @@ python -m src.main
 
 1. **Create Application**
    - Go to [Discord Developer Portal](https://discord.com/developers/applications)
-   - Click "New Application" and name your bot
+   - Click "New Application" and name it "Jarvis"
 
 2. **Configure Bot**
    - Navigate to "Bot" section
@@ -129,8 +133,8 @@ python -m src.main
      - ✅ Speak
      - ✅ Use Voice Activity
 
-5. **Invite Bot**
-   - Use the generated URL to invite the bot to your server
+5. **Invite Jarvis**
+   - Use the generated URL to invite Jarvis to your server
 
 ---
 
@@ -140,9 +144,9 @@ python -m src.main
 
 | Command | Description |
 |---------|-------------|
-| `/join` | 🔊 Join your current voice channel |
-| `/leave` | 👋 Leave the voice channel |
-| `/status` | 📊 Show bot status, settings, and queue size |
+| `/join` | 🔊 Jarvis joins your current voice channel |
+| `/leave` | 👋 Jarvis leaves the voice channel |
+| `/status` | 📊 Show Jarvis status, settings, and queue size |
 | `/ask <prompt>` | 💬 Send a text prompt (queued if busy) |
 | `/queue` | 📋 View pending prompts |
 
@@ -158,7 +162,7 @@ python -m src.main
 
 ## ⚙️ Configuration
 
-The bot uses **two configuration sources**:
+Jarvis uses **two configuration sources**:
 
 | File | Purpose | Reload |
 |------|---------|--------|
@@ -173,12 +177,12 @@ GEMINI_API_KEY=your_gemini_key
 DISCORD_APPLICATION_ID=optional_app_id
 ```
 
-### `config.yaml` — Bot Settings
+### `config.yaml` — Jarvis Settings
 
 ```yaml
 # Wake Word Configuration
 wake_word:
-  phrase: "hey_jarvis"     # Wake phrase to listen for
+  phrase: "hey_jarvis"     # The iconic wake phrase
   threshold: 0.3           # Detection sensitivity (0.0-1.0)
 
 # Voice Settings
@@ -198,10 +202,12 @@ behavior:
   capture_duration: 7.0    # Max seconds to record after wake word
   silence_threshold: 1.0   # Seconds of silence to end capture
 
-# Customize personality
+# Customize Jarvis's personality
 system_prompt: |
-  You are a helpful voice assistant in a Discord voice channel.
-  Keep your responses concise and conversational.
+  You are Jarvis, an AI assistant inspired by Tony Stark's J.A.R.V.I.S.
+  You are helpful, witty, and slightly formal in your responses.
+  Keep responses concise since they will be spoken aloud.
+  Occasionally use dry humor when appropriate.
   Avoid markdown formatting since this is voice output.
 
 # Audio Settings
@@ -218,7 +224,7 @@ logging:
 
 | Wake Word | Model Name |
 |-----------|------------|
-| `hey_jarvis` | Default, recommended |
+| `hey_jarvis` | **Default** — *"Hey Jarvis"* |
 | `alexa` | Amazon Alexa |
 | `hey_mycroft` | Mycroft assistant |
 | `timer` | Keyword detection |
@@ -245,6 +251,8 @@ All above voices plus:
 | `Sulafat` | Warm, confident, persuasive |
 | `Despina` | Warm, inviting, smooth |
 | `Vindemiatrix` | Calm, mature, reassuring |
+
+> 💡 **Tip**: For the most Jarvis-like experience, try `Charon` (authoritative) or `Orus` (professional)
 
 ---
 
@@ -276,7 +284,7 @@ All above voices plus:
 │   Per-user models    │   │    + Streaming ring buffer           │
 └──────────┬───────────┘   └──────────────────┬───────────────────┘
            │                                   │
-           │ Wake word detected                │ Audio stream
+           │ "Hey Jarvis" detected             │ Audio stream
            ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    VoiceHandler                                  │
@@ -302,7 +310,7 @@ All above voices plus:
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   Discord Voice Channel                          │
-│                        (Audio Out)                               │
+│                    (Jarvis Responds)                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -335,7 +343,7 @@ discord-live-vc-bot/
 │       └── logger.py        # Logging setup
 ├── .env                     # API keys (create this)
 ├── .gitignore
-├── config.yaml              # Bot configuration
+├── config.yaml              # Jarvis configuration
 ├── requirements.txt         # Python dependencies
 └── README.md
 ```
@@ -372,16 +380,16 @@ discord-live-vc-bot/
 
 ## 🔍 Troubleshooting
 
-### Bot Can't Hear Users
+### Jarvis Can't Hear Users
 
-1. ✅ Ensure bot has **"Use Voice Activity"** permission
+1. ✅ Ensure Jarvis has **"Use Voice Activity"** permission
 2. ✅ Check that users aren't server-muted or self-deafened
-3. ✅ Verify the bot is properly connected (check `/status`)
+3. ✅ Verify Jarvis is properly connected (check `/status`)
 
 ### Wake Word Not Detecting
 
 1. ⬇️ Lower the `threshold` in `config.yaml` (try `0.3` or `0.2`)
-2. 🎤 Speak clearly and at normal volume
+2. 🎤 Speak clearly: *"Hey Jarvis"*
 3. 🔊 Ensure your microphone is working in Discord
 4. 📊 Enable `log_audio: true` in config for debugging
 
@@ -391,15 +399,15 @@ discord-live-vc-bot/
 2. ⬆️ Increase `playback_buffer_ms` (try `300` or `400`)
 3. 🌍 Gemini API latency varies by region and load
 
-### Bot Disconnects Unexpectedly
+### Jarvis Disconnects Unexpectedly
 
-1. 🔄 The bot auto-reconnects to Gemini on errors
+1. 🔄 Jarvis auto-reconnects to Gemini on errors
 2. 📋 Check logs for specific error messages
 3. ✅ Verify API keys are valid and have quota
 
 ### No Audio Response
 
-1. 🔇 Check bot isn't muted in Discord
+1. 🔇 Check Jarvis isn't muted in Discord
 2. ⚙️ Verify Gemini model and voice compatibility
 3. 📊 Enable `DEBUG` logging to trace the pipeline
 
@@ -410,13 +418,13 @@ discord-live-vc-bot/
 - **Never commit `.env`** — It's in `.gitignore` by default
 - API keys are only stored in `.env` (not in `config.yaml`)
 - Docker container runs as non-root user (`botuser`)
-- Bot only accesses voice channels it's invited to
+- Jarvis only accesses voice channels it's invited to
 
 ---
 
 ## 📝 License
 
-MIT License — See [LICENSE](LICENSE.txt) for details.
+MIT License — See [LICENSE](LICENSE) for details.
 
 ---
 
@@ -425,11 +433,16 @@ MIT License — See [LICENSE](LICENSE.txt) for details.
 - [OpenWakeWord](https://github.com/dscripka/openWakeWord) — Wake word detection
 - [Pycord](https://pycord.dev/) — Discord API library
 - [Google Gemini](https://ai.google.dev/) — AI and voice synthesis
+- **Marvel/Iron Man** — For the inspiration behind J.A.R.V.I.S.
 
 ---
 
 <div align="center">
 
+*"I do anything and everything that Mr. Stark requires — including occasionally taking out the trash."*
+
 **Built with ❤️ for Discord voice communities**
+
+🔵 J.A.R.V.I.S. 🔵
 
 </div>
