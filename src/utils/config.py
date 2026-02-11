@@ -2,10 +2,13 @@
 
 import os
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, List, Any
 from dotenv import load_dotenv
+
+logger = logging.getLogger("discord_bot.utils.config")
 
 
 @dataclass
@@ -149,6 +152,8 @@ class Config:
             playback_buffer_ms=audio_config.get("playback_buffer_ms", 200),
             _config_path=resolved_config_path,
         )
+        config._validate()
+        return config
     
     def add_change_listener(self, listener: Callable[["Config", List[str]], Any]) -> None:
         """Add a listener that will be called when config changes.
@@ -158,6 +163,40 @@ class Config:
         """
         if listener not in self._change_listeners:
             self._change_listeners.append(listener)
+    
+    def _validate(self) -> None:
+        """Validate configuration field values and clamp to valid ranges.
+        
+        Logs warnings for out-of-range values and clamps them.
+        Raises ValueError for values that cannot be corrected.
+        """
+        VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        
+        # Wake word threshold: clamp to [0.0, 1.0]
+        if self.wake_word_threshold < 0.0:
+            logger.warning("wake_word_threshold %.2f is below 0.0, clamping to 0.0", self.wake_word_threshold)
+            self.wake_word_threshold = 0.0
+        elif self.wake_word_threshold > 1.0:
+            logger.warning("wake_word_threshold %.2f is above 1.0, clamping to 1.0", self.wake_word_threshold)
+            self.wake_word_threshold = 1.0
+        
+        # Capture duration: must be positive
+        if self.capture_duration <= 0:
+            raise ValueError(f"capture_duration must be positive, got {self.capture_duration}")
+        
+        # Silence threshold: must be positive
+        if self.silence_threshold <= 0:
+            raise ValueError(f"silence_threshold must be positive, got {self.silence_threshold}")
+        
+        # Playback buffer: must be non-negative
+        if self.playback_buffer_ms < 0:
+            logger.warning("playback_buffer_ms %d is negative, clamping to 0", self.playback_buffer_ms)
+            self.playback_buffer_ms = 0
+        
+        # Log level: must be valid
+        if self.log_level.upper() not in VALID_LOG_LEVELS:
+            logger.warning("Invalid log_level '%s', defaulting to INFO", self.log_level)
+            self.log_level = "INFO"
     
     def remove_change_listener(self, listener: Callable[["Config", List[str]], Any]) -> None:
         """Remove a change listener.
@@ -262,11 +301,13 @@ class Config:
         
         # Notify listeners if there were changes
         if changed_fields:
+            self._validate()
             for listener in self._change_listeners:
                 try:
                     listener(self, changed_fields)
-                except Exception:
-                    pass  # Don't let listener errors break reload
+                except Exception as exc:
+                    # Don't let listener errors break reload.
+                    logger.warning("Config change listener failed: %s", exc, exc_info=True)
         
         return changed_fields
     
@@ -309,6 +350,7 @@ class Config:
             import yaml
         except ImportError:
             # If PyYAML not installed, return empty dict
+            logger.warning("PyYAML is not installed; config YAML will be ignored")
             return {}, None
         
         # Default paths to check
@@ -327,8 +369,8 @@ class Config:
                     with open(path, 'r', encoding='utf-8') as f:
                         config = yaml.safe_load(f)
                         return (config if config else {}, str(path.absolute()))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to load config file '%s': %s", path, exc, exc_info=True)
         
         return {}, None
     
@@ -404,19 +446,19 @@ class ConfigWatcher:
                 try:
                     current_mtime = Path(self.config._config_path).stat().st_mtime
                 except (OSError, IOError):
+                    logger.debug("Config watcher could not stat file: %s", self.config._config_path)
                     continue
                 
                 if self._last_mtime is not None and current_mtime > self._last_mtime:
                     # File was modified, reload config
                     changed = self.config.reload()
                     if changed:
-                        # Logging will be handled by the change listeners
-                        pass
+                        logger.info("Config watcher detected changes: %s", ", ".join(changed))
                 
                 self._last_mtime = current_mtime
                 
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
                 # Don't let watcher errors crash the bot
-                pass
+                logger.error("Config watcher loop error: %s", exc, exc_info=True)

@@ -4,19 +4,34 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Union
 
 
 # Global logger cache
 _loggers: dict[str, logging.Logger] = {}
 
-# Log directory
-LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+# Default log directory (project root / logs)
+DEFAULT_LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+
+
+def _resolve_log_dir(log_directory: Optional[Union[str, Path]]) -> Path:
+    """Resolve configured log directory to an absolute path."""
+    if log_directory is None:
+        return DEFAULT_LOG_DIR
+
+    path = Path(log_directory)
+    if path.is_absolute():
+        return path
+
+    # Resolve relative to project root for predictable behavior.
+    return (Path(__file__).parent.parent.parent / path).resolve()
 
 
 def setup_logger(
     name: str = "discord_bot",
     level: str = "INFO",
     enable_debug_file: bool = True,
+    log_directory: Optional[Union[str, Path]] = None,
 ) -> logging.Logger:
     """Set up and configure a logger with console and session file handlers.
     
@@ -26,6 +41,7 @@ def setup_logger(
         name: Logger name.
         level: Log level for console (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         enable_debug_file: Whether to enable debug file logging (default True).
+        log_directory: Optional log directory path (defaults to project logs/).
         
     Returns:
         Configured logger instance.
@@ -40,8 +56,8 @@ def setup_logger(
     # Handlers will filter based on their own levels
     logger.setLevel(logging.DEBUG)
     
-    # Ensure log directory exists
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    resolved_log_dir = _resolve_log_dir(log_directory)
+    resolved_log_dir.mkdir(parents=True, exist_ok=True)
     
     # Create formatters
     # Detailed formatter for file logging
@@ -58,21 +74,25 @@ def setup_logger(
     
     # Console handler - respects the specified level
     log_level = getattr(logging, level.upper(), logging.INFO)
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = logging.StreamHandler(
+        open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)
+    )
     console_handler.setLevel(log_level)
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
     
-    # Session log file - new file for each bot session, captures ALL logs
-    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_log_path = LOG_DIR / f"session_{session_timestamp}.log"
-    session_file_handler = logging.FileHandler(
-        session_log_path,
-        encoding="utf-8",
-    )
-    session_file_handler.setLevel(logging.DEBUG)  # Capture everything
-    session_file_handler.setFormatter(detailed_formatter)
-    logger.addHandler(session_file_handler)
+    session_log_path: Optional[Path] = None
+    if enable_debug_file:
+        # Session log file - new file for each bot session, captures ALL logs
+        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_log_path = resolved_log_dir / f"session_{session_timestamp}.log"
+        session_file_handler = logging.FileHandler(
+            session_log_path,
+            encoding="utf-8",
+        )
+        session_file_handler.setLevel(logging.DEBUG)  # Capture everything
+        session_file_handler.setFormatter(detailed_formatter)
+        logger.addHandler(session_file_handler)
     
     # Prevent propagation to root logger
     logger.propagate = False
@@ -81,8 +101,11 @@ def setup_logger(
     
     # Log startup info
     logger.info(f"Logger initialized: {name}")
-    logger.debug(f"Log directory: {LOG_DIR}")
-    logger.debug(f"Session log file: {session_log_path}")
+    logger.debug(f"Log directory: {resolved_log_dir}")
+    if session_log_path is not None:
+        logger.debug(f"Session log file: {session_log_path}")
+    else:
+        logger.debug("Session log file: disabled")
     
     return logger
 

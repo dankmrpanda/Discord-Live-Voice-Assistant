@@ -23,7 +23,7 @@ wake_word:
   # Lower = more sensitive (may have false positives)
   # Higher = less sensitive (may miss some activations)
   # Recommended: 0.5 for normal use, 0.3 for quiet environments
-  threshold: 0.3
+  threshold: 0.5
 
 # ------------------------------------------------------------
 # Voice Settings (Gemini TTS)

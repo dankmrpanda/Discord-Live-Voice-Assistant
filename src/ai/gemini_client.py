@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import traceback
 from enum import Enum
 from typing import Optional, Callable, Awaitable, AsyncIterator, List
 
@@ -319,7 +320,6 @@ class GeminiLiveClient:
 
         try:
             from google.genai import types
-            import time
 
             self._state = GeminiSessionState.CONNECTING
             logger.info("Connecting to Gemini Live API...")
@@ -405,7 +405,10 @@ class GeminiLiveClient:
                 model=self.model,
                 config=config,
             )
-            self._session = await self._session_manager.__aenter__()
+            self._session = await asyncio.wait_for(
+                self._session_manager.__aenter__(),
+                timeout=30.0,
+            )
             connect_time = time.time() - connect_start
 
             self._state = GeminiSessionState.CONNECTED
@@ -414,6 +417,12 @@ class GeminiLiveClient:
                 f"Connected to Gemini Live API in {connect_time:.3f}s (voice: {self.voice})"
             )
             return True
+
+        except asyncio.TimeoutError:
+            logger.error("Gemini connection timed out after 30s")
+            self._state = GeminiSessionState.ERROR
+            self._record_error()
+            return False
 
         except Exception as e:
             logger.error(f"Failed to connect to Gemini: {e}")
@@ -561,8 +570,6 @@ class GeminiLiveClient:
             return
 
         try:
-            import time
-
             self._audio_buffer.clear()
             logger.debug("Starting to receive responses from Gemini")
             receive_start = time.time()
@@ -650,7 +657,6 @@ class GeminiLiveClient:
             error_msg = str(e)
             logger.error(f"Error receiving response: {e}")
             logger.debug(f"Receive error details: {type(e).__name__}: {e}")
-            import traceback
 
             logger.debug(traceback.format_exc())
 

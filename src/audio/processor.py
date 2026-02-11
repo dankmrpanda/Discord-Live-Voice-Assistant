@@ -19,6 +19,9 @@ class AudioProcessor:
     - Cached filter coefficients to avoid recomputation
     """
     
+    # Class-level flag: log detailed conversion diagnostics only once
+    _conversion_diagnostics_logged = False
+    
     def __init__(
         self,
         discord_sample_rate: int = 48000,
@@ -180,9 +183,21 @@ class AudioProcessor:
         # Convert to numpy
         audio = self.pcm_to_numpy(pcm_data)
         
+        # === ONE-TIME CONVERSION DIAGNOSTIC ===
+        log_diag = not AudioProcessor._conversion_diagnostics_logged
+        if log_diag:
+            AudioProcessor._conversion_diagnostics_logged = True
+            logger.info(f"🔬 CONVERSION DIAGNOSTIC (first chunk only):")
+            logger.info(f"   Input: {len(pcm_data)} bytes, is_stereo={is_stereo}")
+            logger.info(f"   After pcm_to_numpy: shape={audio.shape}, dtype={audio.dtype}, "
+                       f"min={audio.min():.4f}, max={audio.max():.4f}, first_5={audio[:5].tolist()}")
+        
         # Convert stereo to mono FIRST (reduces samples by half before resampling)
         if is_stereo:
             audio = self.stereo_to_mono(audio)
+            if log_diag:
+                logger.info(f"   After stereo_to_mono: shape={audio.shape}, dtype={audio.dtype}, "
+                           f"min={audio.min():.4f}, max={audio.max():.4f}, first_5={audio[:5].tolist()}")
         
         # Resample from 48kHz to 16kHz (uses optimized polyphase: down by 3)
         audio = self.resample(
@@ -191,8 +206,20 @@ class AudioProcessor:
             self.gemini_input_sample_rate,
         )
         
+        if log_diag:
+            logger.info(f"   After resample (48k→16k): shape={audio.shape}, dtype={audio.dtype}, "
+                       f"min={audio.min():.4f}, max={audio.max():.4f}, first_5={audio[:5].tolist()}")
+        
         # Convert back to PCM bytes
-        return self.numpy_to_pcm(audio)
+        result = self.numpy_to_pcm(audio)
+        
+        if log_diag:
+            # Verify the final PCM output
+            verify = np.frombuffer(result, dtype=np.int16)
+            logger.info(f"   Final PCM: {len(result)} bytes, {len(verify)} int16 samples, "
+                       f"min={verify.min()}, max={verify.max()}, first_5={verify[:5].tolist()}")
+        
+        return result
     
     def gemini_to_discord(self, pcm_data: bytes) -> bytes:
         """Convert Gemini output format to Discord playback format.

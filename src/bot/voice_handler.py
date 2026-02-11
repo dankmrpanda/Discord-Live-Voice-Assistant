@@ -242,7 +242,7 @@ class VoiceHandler:
         # Audio capture callback (receives audio and user_id)
         self._capture.set_audio_callback(self._on_audio_chunk_received)
     
-    async def _on_audio_chunk_received(self, audio_data: bytes, user_id: int) -> None:
+    async def _on_audio_chunk_received(self, audio_data: bytes, user_id: int, raw_discord_data: bytes = b"") -> None:
         """Callback when audio chunk is received from a user.
         
         This is called for each processed audio chunk and handles per-user
@@ -251,8 +251,12 @@ class VoiceHandler:
         Args:
             audio_data: PCM audio bytes (16kHz, mono).
             user_id: Discord user ID this audio came from.
+            raw_discord_data: Original raw Discord audio (48kHz stereo) for debug saving.
         """
         if self._state == BotState.LISTENING and user_id != 0:
+            # Save raw Discord audio for debugging (before any conversion)
+            if raw_discord_data:
+                self._wake_detector._dump_raw_discord_audio(user_id, raw_discord_data)
             # Process wake word detection for this specific user
             await self._wake_detector.process_audio_for_user(audio_data, user_id)
     
@@ -396,7 +400,8 @@ class VoiceHandler:
                 self._on_recording_finished,
                 channel,
             )
-            logger.info("Voice recording started - now receiving audio from Discord")
+            logger.info(f"Voice recording started - now receiving audio from Discord "
+                       f"(recording={self._voice_client.recording}, paused={self._voice_client.paused})")
             
             # Start the audio processing loop (for wake word detection)
             logger.debug("Starting audio receive loop")
@@ -529,8 +534,14 @@ class VoiceHandler:
                 if loop_count % 200 == 0:  # Log every 10 seconds (200 * 50ms)
                     active_users = self._capture.get_active_users()
                     detector_users = self._wake_detector.get_active_users()
+                    sink_chunks = self._sink._chunk_count if self._sink else -1
                     logger.debug(f"Audio loop heartbeat: state={self._state.value}, loops={loop_count}, "
-                                f"capture_users={len(active_users)}, detector_users={len(detector_users)}")
+                                f"capture_users={len(active_users)}, detector_users={len(detector_users)}, "
+                                f"sink_chunks={sink_chunks}")
+                    # Warn if recording is active but no audio has been received
+                    if sink_chunks == 0 and loop_count >= 400:
+                        logger.warning("No audio received from Discord after 20+ seconds of recording. "
+                                      "Ensure at least one user is speaking in the voice channel.")
                 
                 # Note: Wake word detection is now handled in _on_audio_chunk_received
                 # which is called per-user when audio is processed

@@ -57,14 +57,14 @@ class DiscordBot(commands.Bot):
             channel = ctx.author.voice.channel
             await ctx.defer()
             success, message = await self.join_voice(channel)
-            await ctx.followup.send(message)
+            await ctx.followup.send(message, ephemeral=not success)
         
         @self.slash_command(name="leave", description="Leave the voice channel")
         async def leave_command(ctx: discord.ApplicationContext) -> None:
             """Slash command to leave voice channel."""
             await ctx.defer()
             success, message = await self.leave_voice(ctx.guild_id)
-            await ctx.followup.send(message)
+            await ctx.followup.send(message, ephemeral=not success)
         
         @self.slash_command(name="status", description="Check the bot's current status")
         async def status_command(ctx: discord.ApplicationContext) -> None:
@@ -96,6 +96,16 @@ class DiscordBot(commands.Bot):
             )
             embed.add_field(name="Wake Phrase", value=f"`{self.config.wake_phrase_display}`", inline=True)
             embed.add_field(name="Voice", value=self.config.gemini_voice, inline=True)
+            embed.add_field(name="Model", value=self.config.gemini_model, inline=True)
+            embed.add_field(
+                name="Features",
+                value=(
+                    f"Capture: {self.config.capture_duration}s • "
+                    f"Silence: {self.config.silence_threshold}s • "
+                    f"Buffer: {self.config.playback_buffer_ms}ms"
+                ),
+                inline=False,
+            )
             
             # Add queue info if connected
             if handler and handler.state != BotState.IDLE:
@@ -124,9 +134,16 @@ class DiscordBot(commands.Bot):
             if handler.state in (BotState.PROCESSING, BotState.SPEAKING):
                 # Queue the prompt for later processing
                 position = handler.queue_text_prompt(prompt, ctx.author.id)
+                if position == -1:
+                    await ctx.respond(
+                        "❌ The prompt queue is full. Please wait for some prompts to be processed first.",
+                        ephemeral=True,
+                    )
+                    return
                 await ctx.respond(
                     f"📋 I'm currently busy. Your prompt has been queued at **position #{position}**. "
                     f"It will be processed automatically after the current request finishes.",
+                    ephemeral=True,
                 )
                 return
             
@@ -205,8 +222,12 @@ class DiscordBot(commands.Bot):
                 description=f"**{len(queue_items)}** prompt(s) waiting to be processed:",
                 color=discord.Color.blue(),
             )
-            
-            for i, (prompt, user_id) in enumerate(queue_items, 1):
+
+            # Keep embeds safely under Discord field limits.
+            max_items_to_show = 10
+            visible_items = queue_items[:max_items_to_show]
+
+            for i, (prompt, user_id) in enumerate(visible_items, 1):
                 # Truncate prompt for display
                 display_prompt = prompt[:80] + "..." if len(prompt) > 80 else prompt
                 embed.add_field(
@@ -214,6 +235,10 @@ class DiscordBot(commands.Bot):
                     value=f"<@{user_id}>: *{display_prompt}*",
                     inline=False,
                 )
+
+            hidden_items = len(queue_items) - len(visible_items)
+            if hidden_items > 0:
+                embed.set_footer(text=f"...and {hidden_items} more prompt(s) not shown.")
             
             await ctx.respond(embed=embed)
         
@@ -319,7 +344,48 @@ class DiscordBot(commands.Bot):
                     ephemeral=True,
                 )
         
-        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue, /stop, /pause, /continue")
+        @self.slash_command(name="help", description="Show all available commands")
+        async def help_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to show available commands."""
+            await ctx.respond(embed=self._build_help_embed(), ephemeral=True)
+        
+        @self.slash_command(name="clearqueue", description="Clear all queued prompts")
+        async def clearqueue_command(ctx: discord.ApplicationContext) -> None:
+            """Slash command to clear the prompt queue."""
+            handler = self.get_voice_handler(ctx.guild_id)
+            if not handler or handler.state == BotState.IDLE:
+                await ctx.respond("I'm not connected to a voice channel.", ephemeral=True)
+                return
+            removed = handler.clear_queue()
+            if removed == 0:
+                await ctx.respond("📋 The queue is already empty.", ephemeral=True)
+            else:
+                await ctx.respond(f"🗑️ Cleared **{removed}** prompt(s) from the queue.")
+        
+        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue, /stop, /pause, /continue, /help, /clearqueue")
+    
+    def _build_help_embed(self) -> discord.Embed:
+        """Build a help embed listing all slash commands."""
+        embed = discord.Embed(
+            title="🤖 Voice Assistant — Commands",
+            description="Here are all available slash commands:",
+            color=discord.Color.green(),
+        )
+        cmds = [
+            ("/join", "Join your current voice channel."),
+            ("/leave", "Leave the voice channel."),
+            ("/status", "Show the bot's current state, model, and settings."),
+            ("/ask <prompt>", "Send a text prompt (queued if busy)."),
+            ("/queue", "View the current prompt queue."),
+            ("/clearqueue", "Clear all queued prompts."),
+            ("/stop", "Stop the current response and move on."),
+            ("/pause", "Pause the bot's spoken response."),
+            ("/continue", "Resume a paused response."),
+            ("/help", "Show this help message."),
+        ]
+        for name, desc in cmds:
+            embed.add_field(name=name, value=desc, inline=False)
+        return embed
     
     async def on_ready(self) -> None:
         """Handle bot ready event."""
@@ -352,7 +418,7 @@ class DiscordBot(commands.Bot):
             
             # Check if bot is in the same channel the user left from
             if handler and handler.is_connected:
-                if handler._voice_client and handler._voice_client.channel == before.channel:
+                if handler.is_connected_to_channel(before.channel):
                     logger.debug(f"User {member.name} ({member.id}) left voice channel, cleaning up resources")
                     handler.cleanup_user(member.id)
         
@@ -379,7 +445,7 @@ class DiscordBot(commands.Bot):
                         return
                     
                     # Ignore if the voice client is still connected (spurious event)
-                    if handler._voice_client and handler._voice_client.is_connected():
+                    if handler.is_connected:
                         logger.debug(f"Ignoring spurious disconnect event - voice client still connected")
                         return
                 
