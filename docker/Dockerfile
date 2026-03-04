@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnacl-dev \
     libsndfile1 \
     portaudio19-dev \
+    libasound2-dev \
+    python3-dev \
+    pkg-config \
+    cmake \
     gcc \
     g++ \
     git \

@@ -24,6 +24,7 @@ class AudioProcessor:
         discord_sample_rate: int = 48000,
         gemini_input_sample_rate: int = 16000,
         gemini_output_sample_rate: int = 24000,
+        input_gain: float = 0.5,
     ):
         """Initialize the audio processor.
         
@@ -31,10 +32,14 @@ class AudioProcessor:
             discord_sample_rate: Discord's audio sample rate (48kHz).
             gemini_input_sample_rate: Sample rate expected by Gemini (16kHz).
             gemini_output_sample_rate: Sample rate output by Gemini (24kHz).
+            input_gain: Gain multiplier for incoming Discord audio (0.0-1.0).
+                        Discord voice audio is often very loud and clips.
+                        Default 0.5 reduces volume by half to prevent clipping.
         """
         self.discord_sample_rate = discord_sample_rate
         self.gemini_input_sample_rate = gemini_input_sample_rate
         self.gemini_output_sample_rate = gemini_output_sample_rate
+        self.input_gain = np.clip(input_gain, 0.01, 2.0)  # Clamp to safe range
         
         # Pre-compute GCD-based resampling ratios for common conversions
         # Discord (48kHz) to Gemini input (16kHz): 48/16 = 3/1 (downsample by 3)
@@ -43,7 +48,8 @@ class AudioProcessor:
         self._setup_resampling_ratios()
         
         logger.debug(f"AudioProcessor initialized: discord={discord_sample_rate}Hz, "
-                    f"gemini_in={gemini_input_sample_rate}Hz, gemini_out={gemini_output_sample_rate}Hz")
+                    f"gemini_in={gemini_input_sample_rate}Hz, gemini_out={gemini_output_sample_rate}Hz, "
+                    f"input_gain={self.input_gain}")
     
     def _setup_resampling_ratios(self) -> None:
         """Pre-compute optimal resampling ratios using GCD."""
@@ -142,6 +148,29 @@ class AudioProcessor:
         resampled = signal.resample(audio, num_samples)
         return resampled.astype(np.float32)
     
+    def normalize_audio(self, audio: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
+        """Normalize audio to prevent clipping by scaling peak to target level.
+        
+        This ensures that after resampling (which can overshoot), the audio
+        stays within [-1, 1] range without hard clipping distortion.
+        
+        Args:
+            audio: Audio samples as float32 numpy array.
+            target_peak: Target peak amplitude (0.0-1.0). Default 0.95
+                         leaves headroom for downstream processing.
+            
+        Returns:
+            Normalized audio array.
+        """
+        if len(audio) == 0:
+            return audio
+        
+        peak = np.max(np.abs(audio))
+        if peak > target_peak:
+            audio = audio * (target_peak / peak)
+        
+        return audio
+    
     def stereo_to_mono(self, audio: np.ndarray) -> np.ndarray:
         """Convert stereo audio to mono by averaging channels.
         
@@ -180,6 +209,11 @@ class AudioProcessor:
         # Convert to numpy
         audio = self.pcm_to_numpy(pcm_data)
         
+        # Apply input gain to reduce volume from Discord
+        # Discord voice audio is often very loud and causes clipping/distortion
+        if self.input_gain != 1.0:
+            audio = audio * self.input_gain
+        
         # Convert stereo to mono FIRST (reduces samples by half before resampling)
         if is_stereo:
             audio = self.stereo_to_mono(audio)
@@ -190,6 +224,9 @@ class AudioProcessor:
             self.discord_sample_rate,
             self.gemini_input_sample_rate,
         )
+        
+        # Normalize to prevent clipping from resampling filter overshoot
+        audio = self.normalize_audio(audio)
         
         # Convert back to PCM bytes
         return self.numpy_to_pcm(audio)

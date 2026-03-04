@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
 import discord
+import numpy as np
 
 from ..utils.logger import get_logger
 from ..audio.capture import AudioCapture
@@ -73,6 +74,7 @@ class VoiceHandler:
             discord_sample_rate=config.discord_sample_rate,
             gemini_input_sample_rate=config.gemini_input_sample_rate,
             gemini_output_sample_rate=config.gemini_output_sample_rate,
+            input_gain=getattr(config, 'input_gain', 0.5),
         )
         
         self._capture = AudioCapture(
@@ -157,6 +159,10 @@ class VoiceHandler:
         if "playback_buffer_ms" in changed_fields:
             self._playback.buffer_ms = config.playback_buffer_ms
             logger.info(f"  → Playback buffer: {config.playback_buffer_ms}ms")
+        
+        if "input_gain" in changed_fields:
+            self._processor.input_gain = np.clip(config.input_gain, 0.01, 2.0)
+            logger.info(f"  → Input gain: {self._processor.input_gain}")
         
         if "log_audio" in changed_fields:
             self.log_audio = config.log_audio

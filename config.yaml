@@ -109,6 +109,14 @@ system_prompt: |
 # Audio Settings (Advanced)
 # ------------------------------------------------------------
 audio:
+  # Input gain for Discord voice audio (0.0 to 1.0)
+  # Discord audio from voice channels is often very loud, causing clipping
+  # and distortion that breaks wake word detection and Gemini transcription.
+  # Lower values = quieter input. 0.5 = half volume (recommended starting point).
+  # If the bot can't detect wake words, try lowering this. If it can't hear
+  # quiet speakers, try raising it.
+  input_gain: 0.5
+  
   # Discord audio sample rate (don't change unless you know what you're doing)
   discord_sample_rate: 48000
   

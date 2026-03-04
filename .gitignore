@@ -56,6 +56,7 @@ docker-compose.override.yml
 *.mp3
 *.opus
 audio_cache/
+audio_debug_*/
 
 # Testing
 .pytest_cache/

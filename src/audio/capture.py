@@ -9,6 +9,10 @@ import numpy as np
 from ..utils.logger import get_logger
 from .processor import AudioProcessor
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..utils.audio_logger import AudioDebugLogger
+
 logger = get_logger("audio.capture")
 
 # VAD/Energy detection constants
@@ -36,6 +40,7 @@ class AudioCapture:
         buffer_duration: float = 30.0,
         chunk_duration: float = 0.1,
         silence_threshold: float = DEFAULT_SILENCE_DURATION,
+        audio_debug_logger: "AudioDebugLogger | None" = None,
     ):
         """Initialize the audio capture.
         
@@ -99,6 +104,9 @@ class AudioCapture:
         # State
         self._is_capturing = False
         self._lock = asyncio.Lock()
+        
+        # Audio debug logger (optional)
+        self._audio_debug_logger = audio_debug_logger
     
     def set_audio_callback(
         self,
@@ -204,6 +212,11 @@ class AudioCapture:
         # Convert to Gemini format (16kHz mono)
         gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo)
         audio = self.processor.pcm_to_numpy(gemini_pcm)
+        
+        # Audio debug logging: stage 1 (raw) and stage 2 (converted)
+        if self._audio_debug_logger and self._audio_debug_logger.enabled:
+            self._audio_debug_logger.log_raw_discord(pcm_data, user_id)
+            self._audio_debug_logger.log_converted(gemini_pcm, user_id)
         
         # Get or create user's buffer
         self._ensure_user_buffer(user_id)

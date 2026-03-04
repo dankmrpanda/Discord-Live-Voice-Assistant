@@ -55,6 +55,7 @@ class Config:
     gemini_output_sample_rate: int = 24000  # Gemini outputs 24kHz
     audio_channels: int = 1  # Mono
     playback_buffer_ms: int = 200  # Buffer delay before playback starts
+    input_gain: float = 0.5  # Gain multiplier for incoming Discord audio
     
     # Internal: config file path for reloading
     _config_path: Optional[str] = field(default=None, repr=False)
@@ -147,6 +148,7 @@ class Config:
             gemini_input_sample_rate=audio_config.get("gemini_input_sample_rate", 16000),
             gemini_output_sample_rate=audio_config.get("gemini_output_sample_rate", 24000),
             playback_buffer_ms=audio_config.get("playback_buffer_ms", 200),
+            input_gain=float(audio_config.get("input_gain", 0.5)),
             _config_path=resolved_config_path,
         )
     
@@ -247,6 +249,11 @@ class Config:
         if self.playback_buffer_ms != new_playback_buffer_ms:
             changed_fields.append("playback_buffer_ms")
             self.playback_buffer_ms = new_playback_buffer_ms
+        
+        new_input_gain = float(audio_config.get("input_gain", 0.5))
+        if self.input_gain != new_input_gain:
+            changed_fields.append("input_gain")
+            self.input_gain = new_input_gain
         
         # Logging settings (from config.yaml only)
         logging_config = yaml_config.get("logging", {})
