@@ -3,7 +3,7 @@
 import asyncio
 import time
 from enum import Enum
-from typing import Optional, Callable, Awaitable, AsyncIterator, List
+from typing import Optional, AsyncIterator, List
 
 from ..utils.logger import get_logger
 
@@ -86,11 +86,6 @@ class GeminiLiveClient:
         self._session = None
         self._session_manager = None
         self._state: GeminiSessionState = GeminiSessionState.DISCONNECTED
-
-        # Callbacks
-        self._audio_callback: Optional[Callable[[bytes], Awaitable[None]]] = None
-        self._text_callback: Optional[Callable[[str], Awaitable[None]]] = None
-        self._completion_callback: Optional[Callable[[], Awaitable[None]]] = None
 
         # Audio buffer for collecting response
         self._audio_buffer: List[bytes] = []
@@ -273,28 +268,6 @@ class GeminiLiveClient:
             return False
 
     # --------------------------------------------------------------------- #
-    # Callback registration
-    # --------------------------------------------------------------------- #
-
-    def set_audio_callback(
-        self, callback: Optional[Callable[[bytes], Awaitable[None]]]
-    ) -> None:
-        """Set callback for receiving audio chunks."""
-        self._audio_callback = callback
-
-    def set_text_callback(
-        self, callback: Optional[Callable[[str], Awaitable[None]]]
-    ) -> None:
-        """Set callback for receiving text transcriptions."""
-        self._text_callback = callback
-
-    def set_completion_callback(
-        self, callback: Optional[Callable[[], Awaitable[None]]]
-    ) -> None:
-        """Set callback for when response is complete."""
-        self._completion_callback = callback
-
-    # --------------------------------------------------------------------- #
     # Connection management
     # --------------------------------------------------------------------- #
 
@@ -464,7 +437,7 @@ class GeminiLiveClient:
             logger.warning(
                 f"Audio data has odd number of bytes ({len(audio_data)}), trimming"
             )
-            audio_data = audio_data[:-1]
+            audio_data = audio_data + b'\x00'
 
         # Skip very small chunks to avoid spammy tiny frames
         if len(audio_data) < self.MIN_AUDIO_CHUNK_SIZE:
@@ -481,6 +454,7 @@ class GeminiLiveClient:
                 f"Sending audio: {len(audio_data)} bytes (~{seconds:.2f}s at 16kHz)"
             )
 
+            send_start = time.time()
             # Official pattern: use media=Blob(...) :contentReference[oaicite:4]{index=4}
             await self._session.send_realtime_input(
                 media=types.Blob(
@@ -488,6 +462,9 @@ class GeminiLiveClient:
                     data=audio_data,
                 )
             )
+            send_ms = (time.time() - send_start) * 1000
+            if send_ms > 50:
+                logger.warning(f"Slow Gemini send: {send_ms:.1f} ms for {len(audio_data)} bytes")
 
             self._state = GeminiSessionState.STREAMING
             self._update_activity()  # Mark successful send
@@ -592,9 +569,6 @@ class GeminiLiveClient:
                                     f"({total_bytes} bytes total)"
                                 )
 
-                            if self._audio_callback:
-                                await self._audio_callback(audio_bytes)
-
                             # Yield the audio chunk
                             yield audio_bytes
 
@@ -605,18 +579,14 @@ class GeminiLiveClient:
                     logger.debug(
                         f"Received text from Gemini: {text[:100]}..."
                     )
-                    if self._text_callback:
-                        await self._text_callback(text)
 
                 # 2) Output audio transcription (if enabled in config)
                 if server_content and getattr(
                     server_content, "output_audio_transcription", None
                 ):
                     oat = server_content.output_audio_transcription
-                    # Shape is OutputAudioTranscription; keep this robust.
                     transcript_text = None
                     try:
-                        # Newer SDKs may expose `transcriptions` list
                         trans_list = getattr(oat, "transcriptions", None)
                         if trans_list:
                             transcript_text = " ".join(
@@ -631,19 +601,15 @@ class GeminiLiveClient:
                         logger.debug(
                             f"Received transcription: {transcript_text[:100]}..."
                         )
-                        if self._text_callback:
-                            await self._text_callback(transcript_text)
 
                 # ---- Turn completion ----
                 if server_content and getattr(server_content, "turn_complete", False):
                     elapsed = time.time() - receive_start
-                    self._update_activity()  # Mark successful response completion
+                    self._update_activity()
                     logger.info(
                         f"Gemini response complete: {chunk_count} chunks, "
                         f"{total_bytes} bytes in {elapsed:.3f}s"
                     )
-                    if self._completion_callback:
-                        await self._completion_callback()
                     break
 
         except Exception as e:
@@ -658,6 +624,24 @@ class GeminiLiveClient:
             # request (bad schema, wrong field types, etc.), and the server
             # closed the WebSocket. We mark the session as ERROR so the
             # caller can reconnect cleanly.
+            close_code = "unknown"
+            if "1007" in error_msg:
+                close_code = "1007/invalid-payload"
+            elif "1006" in error_msg:
+                close_code = "1006/abnormal-close"
+            elif "1001" in error_msg:
+                close_code = "1001/going-away"
+            elif "1011" in error_msg:
+                close_code = "1011/server-error"
+            elif "429" in error_msg or "rate" in error_msg.lower():
+                close_code = "429/rate-limited"
+
+            if close_code != "unknown":
+                logger.warning(
+                    f"WebSocket close code {close_code} detected, "
+                    "marking session for reconnection"
+                )
+
             if "1007" in error_msg or "invalid frame payload" in error_msg.lower():
                 logger.warning(
                     "WebSocket 1007 / invalid payload detected, "
@@ -665,48 +649,7 @@ class GeminiLiveClient:
                 )
 
             self._state = GeminiSessionState.ERROR
-            self._record_error()  # Track receive failure
-
-    async def get_full_audio_response(self) -> bytes:
-        """Collect full audio response."""
-        logger.debug("Collecting full audio response")
-        audio_chunks: List[bytes] = []
-        async for chunk in self.receive_responses():
-            audio_chunks.append(chunk)
-        return b"".join(audio_chunks)
-
-    # --------------------------------------------------------------------- #
-    # High-level helpers
-    # --------------------------------------------------------------------- #
-
-    async def process_voice_request(self, audio_data: bytes) -> Optional[bytes]:
-        """Process a complete voice request and get audio response.
-
-        This is a convenience method that sends audio, ends the turn,
-        and collects the full response.
-
-        Args:
-            audio_data: User's voice input (16kHz, 16-bit, mono PCM).
-
-        Returns:
-            Audio response bytes, or None if error.
-        """
-        try:
-            if not self.is_connected:
-                ok = await self.connect()
-                if not ok:
-                    return None
-
-            await self.send_audio(audio_data)
-            await self.end_turn()
-
-            return await self.get_full_audio_response()
-
-        except Exception as e:
-            logger.error(f"Error processing voice request: {e}")
-            logger.debug(f"process_voice_request error details: {type(e).__name__}: {e}")
-            self._state = GeminiSessionState.ERROR
-            return None
+            self._record_error()
 
     # --------------------------------------------------------------------- #
     # Async context manager

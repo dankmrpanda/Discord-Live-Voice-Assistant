@@ -1,11 +1,14 @@
 """Configuration management for the Discord bot."""
 
+import logging
 import os
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, List, Any
 from dotenv import load_dotenv
+
+logger = logging.getLogger("utils.config")
 
 
 @dataclass
@@ -56,7 +59,16 @@ class Config:
     audio_channels: int = 1  # Mono
     playback_buffer_ms: int = 200  # Buffer delay before playback starts
     input_gain: float = 0.5  # Gain multiplier for incoming Discord audio
-    
+
+    # Diagnostics
+    diag_dry_run: bool = False
+    diag_dry_run_output: str = "out/test.wav"
+    diag_dry_run_duration: float = 10.0
+    diag_audio_contract_validation: bool = False
+    diag_mock_sink_queue_seconds: float = 2.0
+    diag_dump_raw_audio: bool = False
+    diag_dump_audio_dir: str = "out/raw_audio"
+
     # Internal: config file path for reloading
     _config_path: Optional[str] = field(default=None, repr=False)
     
@@ -125,7 +137,10 @@ class Config:
         
         # Get system prompt
         system_prompt = yaml_config.get("system_prompt", cls._default_system_prompt())
-        
+
+        # Get diagnostics settings
+        diag_config = yaml_config.get("diagnostics", {})
+
         return cls(
             discord_bot_token=discord_token,
             discord_application_id=os.getenv("DISCORD_APPLICATION_ID"),
@@ -149,6 +164,13 @@ class Config:
             gemini_output_sample_rate=audio_config.get("gemini_output_sample_rate", 24000),
             playback_buffer_ms=audio_config.get("playback_buffer_ms", 200),
             input_gain=float(audio_config.get("input_gain", 0.5)),
+            diag_dry_run=diag_config.get("dry_run", False),
+            diag_dry_run_output=diag_config.get("dry_run_output", "out/test.wav"),
+            diag_dry_run_duration=float(diag_config.get("dry_run_duration", 10.0)),
+            diag_audio_contract_validation=diag_config.get("audio_contract_validation", False),
+            diag_mock_sink_queue_seconds=float(diag_config.get("mock_sink_queue_seconds", 2.0)),
+            diag_dump_raw_audio=diag_config.get("dump_raw_audio", False),
+            diag_dump_audio_dir=diag_config.get("dump_audio_dir", "out/raw_audio"),
             _config_path=resolved_config_path,
         )
     
@@ -266,28 +288,54 @@ class Config:
         if self.log_audio != new_log_audio:
             changed_fields.append("log_audio")
             self.log_audio = new_log_audio
-        
+
+        # Diagnostics settings
+        diag_config = yaml_config.get("diagnostics", {})
+
+        new_diag_dry_run = diag_config.get("dry_run", False)
+        if self.diag_dry_run != new_diag_dry_run:
+            changed_fields.append("diag_dry_run")
+            self.diag_dry_run = new_diag_dry_run
+
+        new_diag_dry_run_output = diag_config.get("dry_run_output", "out/test.wav")
+        if self.diag_dry_run_output != new_diag_dry_run_output:
+            changed_fields.append("diag_dry_run_output")
+            self.diag_dry_run_output = new_diag_dry_run_output
+
+        new_diag_dry_run_duration = float(diag_config.get("dry_run_duration", 10.0))
+        if self.diag_dry_run_duration != new_diag_dry_run_duration:
+            changed_fields.append("diag_dry_run_duration")
+            self.diag_dry_run_duration = new_diag_dry_run_duration
+
+        new_diag_contract = diag_config.get("audio_contract_validation", False)
+        if self.diag_audio_contract_validation != new_diag_contract:
+            changed_fields.append("diag_audio_contract_validation")
+            self.diag_audio_contract_validation = new_diag_contract
+
+        new_diag_mock_sink = float(diag_config.get("mock_sink_queue_seconds", 2.0))
+        if self.diag_mock_sink_queue_seconds != new_diag_mock_sink:
+            changed_fields.append("diag_mock_sink_queue_seconds")
+            self.diag_mock_sink_queue_seconds = new_diag_mock_sink
+
+        new_diag_dump_raw = diag_config.get("dump_raw_audio", False)
+        if self.diag_dump_raw_audio != new_diag_dump_raw:
+            changed_fields.append("diag_dump_raw_audio")
+            self.diag_dump_raw_audio = new_diag_dump_raw
+
+        new_diag_dump_dir = diag_config.get("dump_audio_dir", "out/raw_audio")
+        if self.diag_dump_audio_dir != new_diag_dump_dir:
+            changed_fields.append("diag_dump_audio_dir")
+            self.diag_dump_audio_dir = new_diag_dump_dir
+
         # Notify listeners if there were changes
         if changed_fields:
             for listener in self._change_listeners:
                 try:
                     listener(self, changed_fields)
-                except Exception:
-                    pass  # Don't let listener errors break reload
+                except Exception as e:
+                    logger.error(f"Config change listener error ({listener.__qualname__}): {e}", exc_info=True)
         
         return changed_fields
-    
-    @classmethod
-    def from_env(cls, env_path: Optional[str] = None) -> "Config":
-        """Load configuration from environment variables only (legacy method).
-        
-        Args:
-            env_path: Optional path to .env file.
-            
-        Returns:
-            Config instance with loaded values.
-        """
-        return cls.load(env_path=env_path)
     
     @staticmethod
     def _load_yaml(config_path: Optional[str] = None) -> dict:
@@ -416,14 +464,15 @@ class ConfigWatcher:
                 if self._last_mtime is not None and current_mtime > self._last_mtime:
                     # File was modified, reload config
                     changed = self.config.reload()
-                    if changed:
-                        # Logging will be handled by the change listeners
-                        pass
-                
-                self._last_mtime = current_mtime
-                
+                    # Re-stat after reload to avoid missing concurrent changes
+                    try:
+                        self._last_mtime = Path(self.config._config_path).stat().st_mtime
+                    except (OSError, IOError):
+                        self._last_mtime = current_mtime
+                else:
+                    self._last_mtime = current_mtime
+
             except asyncio.CancelledError:
                 break
-            except Exception:
-                # Don't let watcher errors crash the bot
-                pass
+            except Exception as e:
+                logger.warning(f"Config watcher error: {e}")

@@ -17,7 +17,7 @@ wake_word:
   #   - timer         (detects "timer" keyword)
   #   - weather       (detects "weather" keyword)
   # You can also specify a path to a custom .onnx model file
-  phrase: "hey_jarvis"
+  phrase: "alexa"
   
   # Detection sensitivity (0.0 to 1.0)
   # Lower = more sensitive (may have false positives)
@@ -149,3 +149,32 @@ logging:
   # When true, logs details about received audio for debugging
   # Useful for troubleshooting wake word detection issues
   log_audio: true
+
+# ------------------------------------------------------------
+# Diagnostics Settings
+# ------------------------------------------------------------
+# Tools for testing and debugging the audio pipeline.
+# All diagnostics are disabled by default for normal operation.
+diagnostics:
+  # Dry-run mode: bot joins voice, captures audio to a WAV file,
+  # then disconnects automatically. Replaces the old DRY_RUN=1 env var.
+  dry_run: false
+
+  # Output file path for dry-run WAV capture
+  dry_run_output: "logs/test.wav"
+
+  # How many seconds of audio to capture in dry-run mode
+  dry_run_duration: 10.0
+
+  # Enable audio contract validation on every PCM chunk.
+  # Logs warnings on violations. Adds CPU overhead - use only when debugging.
+  audio_contract_validation: false
+
+  # Mock Gemini sink queue depth (seconds of audio) for standalone testing.
+  mock_sink_queue_seconds: 2.0
+
+  # Dump raw Discord audio to WAV files (one per user per session).
+  # Saves to the directory below. Useful for debugging "no audio" or
+  # wake word detection issues.
+  dump_raw_audio: true
+  dump_audio_dir: "logs/"

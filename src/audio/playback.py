@@ -1,7 +1,7 @@
 """Audio playback to Discord voice channels with streaming support."""
 
 import asyncio
-import io
+import struct
 from collections import deque
 from typing import Optional, Callable
 
@@ -13,53 +13,12 @@ from .processor import AudioProcessor
 logger = get_logger("audio.playback")
 
 
-class PCMVolumeTransformer(discord.AudioSource):
-    """An audio source that reads from PCM data with volume control."""
-    
-    def __init__(
-        self,
-        pcm_data: bytes,
-        volume: float = 1.0,
-    ):
-        """Initialize the PCM audio source.
-        
-        Args:
-            pcm_data: Raw PCM audio (48kHz, 16-bit, stereo).
-            volume: Volume multiplier (0.0 to 2.0).
-        """
-        self._pcm_data = pcm_data
-        self._position = 0
-        self._volume = volume
-        # Discord expects 20ms frames of stereo 48kHz 16-bit audio
-        # 48000 * 2 bytes * 2 channels * 0.02 seconds = 3840 bytes
-        self._frame_size = 3840
-    
-    def read(self) -> bytes:
-        """Read the next frame of audio.
-        
-        Returns:
-            20ms of audio data, or empty bytes if finished.
-        """
-        if self._position >= len(self._pcm_data):
-            return b""
-        
-        end = self._position + self._frame_size
-        frame = self._pcm_data[self._position:end]
-        self._position = end
-        
-        # Pad if needed
-        if len(frame) < self._frame_size:
-            frame += b"\x00" * (self._frame_size - len(frame))
-        
-        return frame
-    
-    def is_opus(self) -> bool:
-        """Check if the audio source is Opus encoded."""
-        return False
-    
-    def cleanup(self) -> None:
-        """Clean up resources."""
-        self._pcm_data = b""
+def _apply_volume(frame: bytes, volume: float) -> bytes:
+    """Apply volume multiplier to 16-bit PCM frame data."""
+    n_samples = len(frame) // 2
+    samples = struct.unpack(f"<{n_samples}h", frame)
+    scaled = [max(-32768, min(32767, int(s * volume))) for s in samples]
+    return struct.pack(f"<{n_samples}h", *scaled)
 
 
 class StreamingPCMSource(discord.AudioSource):
@@ -161,8 +120,10 @@ class StreamingPCMSource(discord.AudioSource):
         if len(self._buffer) >= self.FRAME_SIZE:
             frame = bytes(self._buffer[:self.FRAME_SIZE])
             del self._buffer[:self.FRAME_SIZE]
+            if self._volume != 1.0:
+                frame = _apply_volume(frame, self._volume)
             return frame
-        
+
         # If finished and buffer has remaining data, pad and return
         if self._is_finished:
             if len(self._buffer) > 0:
@@ -171,6 +132,8 @@ class StreamingPCMSource(discord.AudioSource):
                 # Pad to frame size
                 if len(frame) < self.FRAME_SIZE:
                     frame += b"\x00" * (self.FRAME_SIZE - len(frame))
+                if self._volume != 1.0:
+                    frame = _apply_volume(frame, self._volume)
                 return frame
             return b""
         
@@ -236,44 +199,7 @@ class AudioPlayback:
     def is_playing(self) -> bool:
         """Check if audio is currently playing."""
         return self._is_playing
-    
-    async def play_gemini_audio(self, pcm_data: bytes) -> None:
-        """Play audio received from Gemini.
-        
-        Args:
-            pcm_data: Raw PCM audio from Gemini (24kHz, mono).
-        """
-        if not self._voice_client or not self._voice_client.is_connected():
-            logger.warning("Cannot play audio: not connected to voice channel")
-            return
-        
-        if self._voice_client.is_playing():
-            logger.debug("Stopping current playback for new audio")
-            self._voice_client.stop()
-        
-        # Convert Gemini format to Discord format
-        discord_pcm = self.processor.gemini_to_discord(pcm_data)
-        
-        # Create audio source
-        source = PCMVolumeTransformer(discord_pcm, volume=self.volume)
-        
-        # Set up completion tracking
-        self._is_playing = True
-        self._playback_complete_event = asyncio.Event()
-        
-        def after_playback(error):
-            if error:
-                logger.error(f"Playback error: {error}")
-            self._is_playing = False
-            if self._playback_complete_event:
-                self._playback_complete_event.set()
-            if self._after_callback:
-                self._after_callback()
-        
-        # Start playback
-        self._voice_client.play(source, after=after_playback)
-        logger.debug(f"Started playback of {len(discord_pcm)} bytes")
-    
+
     async def wait_for_playback(self, timeout: Optional[float] = None) -> bool:
         """Wait for current playback to complete.
         

@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/audio/sink.py)",
+      "Bash(python -m py_compile src/audio/capture.py)",
+      "Bash(python -m py_compile src/audio/playback.py)",
+      "Bash(python -m py_compile src/utils/config.py)",
+      "Bash(python -m py_compile src/ai/gemini_client.py)",
+      "Bash(python -m py_compile src/bot/voice_handler.py)",
+      "Bash(python -m py_compile src/bot/client.py)",
+      "WebFetch(domain:docs.pycord.dev)",
+      "WebFetch(domain:guide.pycord.dev)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:copyprogramming.com)"
+    ]
+  },
+  "enabledPlugins": {
+    "python-debugger@python-debugger-marketplace": true
+  }
+}

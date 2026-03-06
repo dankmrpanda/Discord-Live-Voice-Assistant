@@ -2,12 +2,14 @@
 
 import asyncio
 import threading
+import time as _time
 from collections import deque
 from typing import Optional, Callable, Awaitable, Dict
 import numpy as np
 
 from ..utils.logger import get_logger
 from .processor import AudioProcessor
+from .contract import GEMINI_INPUT_FORMAT, validate_pcm_chunk, compute_audio_stats
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -91,6 +93,13 @@ class AudioCapture:
         self._streaming_buffer_lock = asyncio.Lock()
         self._streaming_data_available = asyncio.Event()
         self._is_streaming_to_gemini = False
+
+        # --- Streaming pipeline metrics ---
+        self._streaming_drops = 0
+        self._streaming_total_pushed = 0
+        self._streaming_total_consumed = 0
+        self._streaming_total_bytes_pushed = 0
+        self._streaming_seq = 0  # monotonic sequence number per streaming session
         
         # VAD state for silence detection
         self._consecutive_silent_frames = 0
@@ -107,6 +116,9 @@ class AudioCapture:
         
         # Audio debug logger (optional)
         self._audio_debug_logger = audio_debug_logger
+
+        # Contract validation toggle (set from config.diagnostics.audio_contract_validation)
+        self.contract_validation: bool = False
     
     def set_audio_callback(
         self,
@@ -211,6 +223,14 @@ class AudioCapture:
         
         # Convert to Gemini format (16kHz mono)
         gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo)
+
+        # Optional contract validation (toggled by diagnostics config)
+        if self.contract_validation:
+            validate_pcm_chunk(
+                gemini_pcm, GEMINI_INPUT_FORMAT,
+                label=f"capture_user_{user_id}", warn_only=True,
+            )
+
         audio = self.processor.pcm_to_numpy(gemini_pcm)
         
         # Audio debug logging: stage 1 (raw) and stage 2 (converted)
@@ -270,12 +290,25 @@ class AudioCapture:
                                     # Not enough speech yet, reset and keep listening
                                     logger.debug(f"VAD: Silence detected but only {speech_duration:.2f}s of speech (need {MIN_SPEECH_DURATION}s), resetting")
                                     self._consecutive_silent_frames = 0
-                                    # Don't reset _speech_detected or _speech_start_time - keep accumulating
+                                    self._speech_detected = False
+                                    self._speech_start_time = 0.0
                 
                 # Push frame directly to streaming ring buffer
                 # deque with maxlen automatically discards oldest if full
-                self._streaming_buffer.append(gemini_pcm)
-                self._streaming_data_available.set()
+                async with self._streaming_buffer_lock:
+                    if len(self._streaming_buffer) == self._streaming_buffer.maxlen:
+                        self._streaming_drops += 1
+                        if self._streaming_drops % 50 == 1:
+                            logger.warning(
+                                f"⚠️ Streaming buffer full — dropping oldest frame "
+                                f"(total drops: {self._streaming_drops}, "
+                                f"depth: {len(self._streaming_buffer)}/{self._streaming_buffer.maxlen})"
+                            )
+                    self._streaming_seq += 1
+                    self._streaming_total_pushed += 1
+                    self._streaming_total_bytes_pushed += len(gemini_pcm)
+                    self._streaming_buffer.append(gemini_pcm)
+                    self._streaming_data_available.set()
             else:
                 # Legacy path: buffer for later concatenation
                 async with self._lock:
@@ -290,148 +323,7 @@ class AudioCapture:
         # Call callback with converted audio and user ID
         if self._audio_callback:
             await self._audio_callback(gemini_pcm, user_id)
-    
-    async def process_discord_audio(
-        self,
-        pcm_data: bytes,
-        is_stereo: bool = True,
-    ) -> None:
-        """Process incoming audio from Discord.
-        
-        Converts Discord format (48kHz stereo) to Gemini format (16kHz mono)
-        and stores in buffer.
-        
-        Args:
-            pcm_data: Raw PCM audio from Discord.
-            is_stereo: Whether the audio is stereo.
-        """
-        if not self._is_capturing:
-            return
-        
-        # Convert to Gemini format
-        gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo)
-        audio = self.processor.pcm_to_numpy(gemini_pcm)
-        
-        async with self._lock:
-            # Add to buffer
-            self._buffer.append(audio)
-            self._buffer_samples += len(audio)
-            
-            # Trim buffer if too large
-            while self._buffer_samples > self._max_buffer_samples:
-                removed = self._buffer.popleft()
-                self._buffer_samples -= len(removed)
-        
-        # Call callback with converted audio (legacy - no user_id)
-        if self._audio_callback:
-            # Try to call with user_id=0 for backwards compatibility
-            try:
-                await self._audio_callback(gemini_pcm, 0)
-            except TypeError:
-                # Old callback signature without user_id
-                await self._audio_callback(gemini_pcm)
-    
-    async def get_recent_audio(self, duration: float, user_id: Optional[int] = None) -> bytes:
-        """Get the most recent audio from the buffer.
-        
-        Args:
-            duration: Duration of audio to retrieve (seconds).
-            user_id: If provided, get audio from this user's buffer only.
-            
-        Returns:
-            PCM audio bytes (16kHz mono).
-        """
-        samples_needed = int(self.processor.gemini_input_sample_rate * duration)
-        
-        if user_id is not None and user_id in self._user_buffers:
-            user_lock = self._get_user_lock(user_id)
-            async with user_lock:
-                if self._user_buffer_samples.get(user_id, 0) == 0:
-                    return b""
-                
-                all_samples = np.concatenate(list(self._user_buffers[user_id]))
-                if len(all_samples) > samples_needed:
-                    all_samples = all_samples[-samples_needed:]
-                
-                return self.processor.numpy_to_pcm(all_samples)
-        
-        # Fall back to shared buffer
-        async with self._lock:
-            if self._buffer_samples == 0:
-                return b""
-            
-            # Collect samples from buffer
-            all_samples = np.concatenate(list(self._buffer))
-            
-            # Get the most recent samples
-            if len(all_samples) > samples_needed:
-                all_samples = all_samples[-samples_needed:]
-            
-            return self.processor.numpy_to_pcm(all_samples)
-    
-    async def get_chunk_for_wake_word_per_user(self, user_id: int) -> Optional[bytes]:
-        """Get audio chunk from a specific user for wake word detection.
-        
-        Args:
-            user_id: Discord user ID.
-            
-        Returns:
-            PCM audio bytes (16kHz mono), or None if buffer is empty.
-        """
-        if user_id not in self._user_buffers:
-            return None
-        
-        user_lock = self._get_user_lock(user_id)
-        async with user_lock:
-            buffer_samples = self._user_buffer_samples.get(user_id, 0)
-            if buffer_samples < self._samples_per_chunk:
-                return None
-            
-            # Collect enough samples
-            all_samples = np.concatenate(list(self._user_buffers[user_id]))
-            
-            # Return the most recent chunk as bytes
-            chunk = all_samples[-self._samples_per_chunk:]
-            return self.processor.numpy_to_pcm(chunk)
-    
-    async def get_chunk_for_wake_word(self) -> Optional[np.ndarray]:
-        """Get audio chunk sized for wake word detection.
-        
-        Returns:
-            Numpy array of audio samples, or None if buffer is empty.
-        """
-        async with self._lock:
-            if self._buffer_samples < self._samples_per_chunk:
-                return None
-            
-            # Collect enough samples
-            all_samples = np.concatenate(list(self._buffer))
-            
-            # Return the most recent chunk
-            return all_samples[-self._samples_per_chunk:]
-    
-    async def get_and_consume_chunk(self) -> Optional[np.ndarray]:
-        """Get all accumulated audio and clear buffer (for streaming to Gemini).
-        
-        This returns all audio accumulated since the last call and clears the buffer,
-        preventing re-sending the same audio data during real-time streaming.
-        
-        Returns:
-            Numpy array of all accumulated audio samples, or None if buffer is empty.
-        """
-        async with self._lock:
-            if self._buffer_samples == 0:
-                return None
-            
-            # Collect all samples in buffer
-            all_samples = np.concatenate(list(self._buffer))
-            
-            # Clear the buffer after consuming
-            self._buffer.clear()
-            self._buffer_samples = 0
-            
-            return all_samples
-    
+
     def clear_buffer(self, user_id: Optional[int] = None) -> None:
         """Clear the audio buffer synchronously.
         
@@ -445,13 +337,6 @@ class AudioCapture:
         else:
             self._buffer.clear()
             self._buffer_samples = 0
-    
-    def clear_all_user_buffers(self) -> None:
-        """Clear all per-user buffers."""
-        for user_id in list(self._user_buffers.keys()):
-            self._user_buffers[user_id].clear()
-            self._user_buffer_samples[user_id] = 0
-        logger.debug("Cleared all user audio buffers")
     
     def cleanup_user(self, user_id: int) -> None:
         """Clean up resources for a user who left the channel.
@@ -481,18 +366,6 @@ class AudioCapture:
         """
         return list(self._user_buffers.keys())
     
-    def get_user_buffer_duration(self, user_id: int) -> float:
-        """Get the duration of audio buffered for a user.
-        
-        Args:
-            user_id: Discord user ID.
-            
-        Returns:
-            Duration in seconds, or 0 if user has no buffer.
-        """
-        samples = self._user_buffer_samples.get(user_id, 0)
-        return samples / self.processor.gemini_input_sample_rate
-    
     # =========================================================================
     # Real-time streaming and VAD methods
     # =========================================================================
@@ -513,9 +386,14 @@ class AudioCapture:
         self._streaming_start_time = time.time()
         self._speech_start_time = 0.0  # Will be set when speech is detected
         self._silence_detected_event = asyncio.Event()
-        # Clear the ring buffer
+        # Clear the ring buffer and reset per-session metrics
         self._streaming_buffer.clear()
         self._streaming_data_available.clear()
+        self._streaming_drops = 0
+        self._streaming_total_pushed = 0
+        self._streaming_total_consumed = 0
+        self._streaming_total_bytes_pushed = 0
+        self._streaming_seq = 0
         logger.debug(f"Started streaming mode for Gemini (grace period: {WAKE_WORD_GRACE_PERIOD}s, min speech: {MIN_SPEECH_DURATION}s)")
     
     def stop_streaming_to_gemini(self) -> None:
@@ -531,24 +409,26 @@ class AudioCapture:
     
     async def get_streaming_chunk(self, timeout: float = 0.1) -> Optional[bytes]:
         """Get the next audio chunk from the streaming ring buffer.
-        
+
         This is the low-latency path for real-time streaming to Gemini.
         Frames are pushed directly without concatenation.
-        
+
         Args:
             timeout: Maximum time to wait for a chunk.
-            
+
         Returns:
             PCM audio bytes, or None if timeout.
         """
-        # First check if there's data available without waiting
-        if self._streaming_buffer:
-            try:
-                return self._streaming_buffer.popleft()
-            except IndexError:
-                pass  # Buffer was emptied by another consumer
-        
-        # Wait for data to become available
+        # Try to pop immediately under lock
+        async with self._streaming_buffer_lock:
+            if self._streaming_buffer:
+                chunk = self._streaming_buffer.popleft()
+                self._streaming_total_consumed += 1
+                return chunk
+            # Buffer empty — clear event BEFORE waiting (under lock) to avoid race
+            self._streaming_data_available.clear()
+
+        # Wait for producer to signal new data
         try:
             await asyncio.wait_for(
                 self._streaming_data_available.wait(),
@@ -556,20 +436,13 @@ class AudioCapture:
             )
         except asyncio.TimeoutError:
             return None
-        
-        # Try to get data from buffer
-        if self._streaming_buffer:
-            try:
+
+        # Try again after wakeup
+        async with self._streaming_buffer_lock:
+            if self._streaming_buffer:
                 chunk = self._streaming_buffer.popleft()
-                # Clear the event if buffer is now empty
-                if not self._streaming_buffer:
-                    self._streaming_data_available.clear()
+                self._streaming_total_consumed += 1
                 return chunk
-            except IndexError:
-                self._streaming_data_available.clear()
-                return None
-        
-        self._streaming_data_available.clear()
         return None
     
     def _compute_rms_energy(self, audio: np.ndarray) -> float:
@@ -604,26 +477,6 @@ class AudioCapture:
                 return False
         return True
     
-    async def wait_for_silence(self, timeout: float = 5.0) -> bool:
-        """Wait for silence to be detected after speech.
-        
-        Args:
-            timeout: Maximum time to wait.
-            
-        Returns:
-            True if silence detected, False if timeout.
-        """
-        if not self._silence_detected_event:
-            return False
-        try:
-            await asyncio.wait_for(
-                self._silence_detected_event.wait(),
-                timeout=timeout
-            )
-            return True
-        except asyncio.TimeoutError:
-            return False
-    
     def reset_vad_state(self) -> None:
         """Reset VAD state for new detection."""
         self._consecutive_silent_frames = 0
@@ -641,3 +494,27 @@ class AudioCapture:
         self.silence_threshold = threshold_seconds
         self._vad_silence_frames = int(threshold_seconds / (FRAME_DURATION_MS / 1000))
         logger.info(f"VAD silence threshold updated: {threshold_seconds}s -> {self._vad_silence_frames} frames")
+
+    # =========================================================================
+    # Pipeline health reporting
+    # =========================================================================
+
+    def get_pipeline_health(self) -> dict:
+        """Return a snapshot of streaming pipeline metrics.
+
+        Designed to be called once per second by the health reporter.
+        """
+        return {
+            "streaming_active": self._is_streaming_to_gemini,
+            "buffer_depth": len(self._streaming_buffer),
+            "buffer_max": self._streaming_buffer.maxlen,
+            "total_pushed": self._streaming_total_pushed,
+            "total_consumed": self._streaming_total_consumed,
+            "total_drops": self._streaming_drops,
+            "total_bytes_pushed": self._streaming_total_bytes_pushed,
+            "active_users": len(self._user_buffers),
+            "active_user_id": self._active_user_id,
+            "speech_detected": self._speech_detected,
+            "silent_frames": self._consecutive_silent_frames,
+            "seq": self._streaming_seq,
+        }

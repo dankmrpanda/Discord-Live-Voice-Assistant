@@ -1,13 +1,12 @@
 """Main entry point for the Discord Live VC Bot."""
 
-import asyncio
 import sys
 import platform
 from pathlib import Path
 
-from .utils.config import Config, ConfigWatcher
+from .utils.config import Config
 from .utils.logger import setup_logger, get_logger
-from .bot.client import DiscordBot, set_bot
+from .bot.client import DiscordBot
 
 
 def main() -> int:
@@ -64,19 +63,23 @@ def main() -> int:
     logger.debug(f"Discord sample rate: {config.discord_sample_rate} Hz")
     logger.debug(f"Gemini input sample rate: {config.gemini_input_sample_rate} Hz")
     logger.debug(f"Gemini output sample rate: {config.gemini_output_sample_rate} Hz")
-    
+
+    # Log active diagnostics
+    if config.diag_dry_run:
+        logger.info(f"DIAGNOSTICS: dry-run mode ENABLED (output: {config.diag_dry_run_output}, duration: {config.diag_dry_run_duration}s)")
+    if config.diag_audio_contract_validation:
+        logger.info("DIAGNOSTICS: audio contract validation ENABLED")
+    if config.diag_dump_raw_audio:
+        logger.info(f"DIAGNOSTICS: raw audio dump ENABLED (dir: {config.diag_dump_audio_dir})")
+
     # Create bot
     logger.debug("Creating DiscordBot instance")
     bot = DiscordBot(config)
-    
-    # Set global reference for slash commands
-    set_bot(bot)
-    logger.debug("Bot reference set for slash commands")
-    
+
     # Run the bot
     try:
         logger.info("Starting Discord bot connection...")
-        # py-cord doesn't use log_handler argument
+        # discord.py handles its own logging via the logging module
         bot.run(config.discord_bot_token)
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
