@@ -1,6 +1,8 @@
 """Voice handler with state machine for managing voice interactions."""
 
 import asyncio
+import logging as _logging
+import time as _time
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
@@ -20,6 +22,58 @@ if TYPE_CHECKING:
     from ..utils.config import Config
 
 logger = get_logger("bot.voice_handler")
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: make voice_recv's PacketRouter survive OpusError
+# ---------------------------------------------------------------------------
+# The library's PacketRouter._do_run() has zero per-packet error handling.
+# A single corrupted Opus packet (common during voice gateway reconnects /
+# SSRC changes) raises OpusError which propagates out of _do_run(), hits the
+# except clause in run(), and kills the entire AudioReader for good.
+#
+# We replace _do_run with a version that catches decode errors per-packet
+# and continues processing instead of crashing the whole reader.
+# ---------------------------------------------------------------------------
+_opus_patch_log = _logging.getLogger("discord.ext.voice_recv.router")
+
+try:
+    from discord.ext.voice_recv.router import PacketRouter as _PacketRouter
+
+    _original_do_run = _PacketRouter._do_run
+
+    def _resilient_do_run(self: "_PacketRouter") -> None:  # type: ignore[name-defined]
+        """Replacement _do_run that catches per-packet decode errors."""
+        _err_count = 0
+        while not self._end_thread.is_set():
+            self.waiter.wait()
+            with self._lock:
+                for decoder in self.waiter.items:
+                    try:
+                        data = decoder.pop_data()
+                    except Exception as _exc:
+                        _err_count += 1
+                        if _err_count <= 5:
+                            _opus_patch_log.warning(
+                                "Opus decode error (count=%d), skipping packet: %s: %s",
+                                _err_count, type(_exc).__name__, _exc,
+                            )
+                        elif _err_count == 50:
+                            _opus_patch_log.error(
+                                "Opus decode errors reached %d — stream may be "
+                                "persistently corrupted", _err_count,
+                            )
+                        continue
+                    if data is not None:
+                        self.sink.write(data.source, data)
+
+    _PacketRouter._do_run = _resilient_do_run
+    logger.info(
+        "Applied OpusError resilience patch to PacketRouter._do_run "
+        "(corrupted packets will be skipped instead of killing the reader)"
+    )
+except Exception as _patch_err:
+    logger.warning(f"Could not apply PacketRouter patch: {_patch_err}")
+# ---------------------------------------------------------------------------
 
 
 class BotState(Enum):
@@ -94,6 +148,15 @@ class VoiceHandler:
         # Listen recovery tracking
         self._last_relisten_time: float = 0.0
         self._relisten_count: int = 0
+
+        # BasicSink strong reference (prevent GC) and audio liveness tracking
+        self._basic_sink: Optional[voice_recv.BasicSink] = None
+        self._last_audio_received_time: float = 0.0
+
+        # Manual Opus decoders — one per SSRC (used with decode=False)
+        self._opus_decoders: dict[int, discord.opus.Decoder] = {}
+        self._opus_decode_errors: int = 0
+        self._dave_decrypt_fn = None  # Optional DAVE decrypt callable
 
         # Create sink helper for audio stats and diagnostics
         self._sink = WakeWordSink(
@@ -321,8 +384,19 @@ class VoiceHandler:
             data: voice_recv.VoiceData with .pcm attribute (48kHz stereo).
         """
         try:
+            # Track last packet time for liveness detection
+            self._last_audio_received_time = _time.monotonic()
+
             pcm_data = data.pcm
             user_id = user.id if user else 0
+
+            # Log every packet size for the first 20 to diagnose short sessions
+            chunk_num = self._sink._chunk_count + 1  # pre-increment estimate
+            if chunk_num <= 20:
+                logger.debug(
+                    f"[recv] pkt#{chunk_num} user={user_id} "
+                    f"pcm={len(pcm_data)}B data_type={type(data).__name__}"
+                )
 
             # Forward to sink helper for stats and raw audio dump
             self._sink.handle_audio(pcm_data, user_id)
@@ -333,30 +407,146 @@ class VoiceHandler:
                     self._capture.process_discord_audio_per_user(pcm_data, user_id, is_stereo=True),
                     self._event_loop,
                 )
-        except Exception as e:
-            logger.error(f"Error in voice audio callback: {e}")
+        except Exception:
+            logger.exception("Error in voice audio callback")
+
+    def _on_voice_audio_raw(self, user, data) -> None:
+        """Synchronous callback from voice_recv.BasicSink(decode=False).
+
+        Called on the PacketRouter thread with raw Opus bytes (transport-
+        decrypted but NOT Opus-decoded).  We decode manually so that a
+        single corrupted packet never kills the AudioReader.
+
+        Uses per-SSRC Opus decoders to avoid state corruption when multiple
+        SSRCs arrive (key rotation, reconnects).  Optionally DAVE-decrypts
+        first if the voice connection has a DAVE session.
+
+        Args:
+            user: discord.User who sent the audio, or None.
+            data: voice_recv.VoiceData — use data.opus for raw Opus bytes.
+        """
+        try:
+            self._last_audio_received_time = _time.monotonic()
+            user_id = user.id if user else 0
+
+            opus_bytes = bytes(data.opus)
+            if not opus_bytes:
+                return
+
+            # --- DAVE decryption (if available) ---
+            if self._dave_decrypt_fn and user_id:
+                try:
+                    # MediaType.audio = 1 (hardcoded to avoid import issues)
+                    opus_bytes = self._dave_decrypt_fn(user_id, 1, opus_bytes)
+                except Exception:
+                    pass  # Fall through to raw Opus decode attempt
+
+            # --- Per-SSRC Opus decoder ---
+            ssrc = getattr(getattr(data, 'packet', None), 'ssrc', 0)
+            decoder = self._opus_decoders.get(ssrc)
+            if decoder is None:
+                decoder = discord.opus.Decoder()
+                self._opus_decoders[ssrc] = decoder
+                logger.info(
+                    f"[recv] Created Opus decoder for SSRC {ssrc} "
+                    f"(user={user_id}, total_decoders={len(self._opus_decoders)})"
+                )
+
+            try:
+                pcm_data = decoder.decode(opus_bytes, fec=False)
+            except Exception as exc:
+                self._opus_decode_errors += 1
+                if self._opus_decode_errors <= 10 or self._opus_decode_errors % 200 == 0:
+                    logger.warning(
+                        f"[recv] Opus decode error #{self._opus_decode_errors} "
+                        f"ssrc={ssrc}: {type(exc).__name__}: {exc}"
+                    )
+                return  # skip this packet, reader stays alive
+
+            # Diagnostic logging for first 20 good packets
+            chunk_num = self._sink._chunk_count + 1
+            if chunk_num <= 20:
+                logger.debug(
+                    f"[recv] pkt#{chunk_num} user={user_id} ssrc={ssrc} "
+                    f"opus={len(bytes(data.opus))}B pcm={len(pcm_data)}B"
+                )
+
+            # Forward to existing pipeline
+            self._sink.handle_audio(pcm_data, user_id)
+
+            if self._event_loop and not self._event_loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    self._capture.process_discord_audio_per_user(
+                        pcm_data, user_id, is_stereo=True
+                    ),
+                    self._event_loop,
+                )
+        except Exception:
+            logger.exception("Error in raw voice audio callback")
+
+    def _on_listener_finished(self, error: "Exception | None") -> None:
+        """Called by voice_recv when the AudioReader stops.
+
+        Runs on a dedicated cleanup thread spawned by the library.
+        The single argument is None for normal shutdown, or the
+        Exception that crashed the PacketRouter / AudioReader.
+        """
+        if error is None:
+            logger.info("[listener] AudioReader finished normally (no error)")
+        else:
+            logger.error(
+                f"[listener] AudioReader DIED with error: {type(error).__name__}: {error}",
+                exc_info=error,
+            )
 
     def _start_listening(self) -> None:
         """Create a BasicSink and start listening on the voice client.
 
-        This is idempotent -- if the voice client is already listening it
-        will stop first, then re-register.  Used both for initial join and
-        for automatic recovery when the reader dies.
+        This is idempotent -- it will always stop the existing listener
+        first (even if is_listening() returns False) to ensure clean
+        teardown of the old AudioReader before creating a new one.
         """
         if not self._voice_client:
             logger.warning("Cannot start listening: no voice client")
             return
 
-        # Stop existing listener if any
+        # ALWAYS call stop_listening() to ensure the old AudioReader is
+        # fully torn down.  When is_listening() is False the reader thread
+        # may have died, but its _reader object still lingers on the
+        # voice client and must be cleaned up before a new listen() call.
         try:
-            if self._voice_client.is_listening():
-                self._voice_client.stop_listening()
+            self._voice_client.stop_listening()
         except Exception:
             pass
 
-        sink = voice_recv.BasicSink(self._on_voice_audio_received)
-        self._voice_client.listen(sink)
-        logger.info("Voice listening started (BasicSink) - now receiving audio from Discord")
+        # Small delay to let the old reader's cleanup thread finish.
+        # The library spawns a background thread for _stop() which may
+        # race with the new reader's start() if we proceed immediately.
+        _time.sleep(0.15)
+
+        self._opus_decoders.clear()
+        self._opus_decode_errors = 0
+        self._dave_decrypt_fn = None
+
+        # Probe for DAVE session (exists in newer discord.py with DAVE support)
+        try:
+            conn = getattr(self._voice_client, '_connection', None)
+            dave = getattr(conn, 'dave_session', None) if conn else None
+            if dave and hasattr(dave, 'decrypt'):
+                dave.set_passthrough_mode(True, 10)
+                self._dave_decrypt_fn = dave.decrypt
+                logger.info("DAVE session detected — will decrypt packets before Opus decode")
+            else:
+                logger.info("No DAVE session — using direct Opus decode")
+        except Exception as e:
+            logger.warning(f"DAVE detection failed: {e} — using direct Opus decode")
+
+        self._basic_sink = voice_recv.BasicSink(self._on_voice_audio_raw, decode=False)
+        self._voice_client.listen(self._basic_sink, after=self._on_listener_finished)
+        logger.info(
+            f"Voice listening started (BasicSink decode=False) - "
+            f"sink_id={id(self._basic_sink):#x}, vc_id={id(self._voice_client):#x}"
+        )
     
     @property
     def state(self) -> BotState:
@@ -586,13 +776,12 @@ class VoiceHandler:
         # Stop listening first (before disabling other components)
         if self._voice_client:
             try:
-                if self._voice_client.is_listening():
-                    logger.debug("Stopping voice listening")
-                    self._voice_client.stop_listening()
+                self._voice_client.stop_listening()
             except Exception as e:
-                logger.warning(f"Error stopping listening: {e}")
-
-        # Clean up sink
+                logger.debug(f"stop_listening during leave: {e}")
+        self._basic_sink = None
+        self._opus_decoders.clear()
+        self._dave_decrypt_fn = None
         if self._sink:
             try:
                 self._sink.cleanup()
@@ -725,13 +914,13 @@ class VoiceHandler:
         to a voice gateway reconnect or PacketRouter crash), this loop
         detects it and re-establishes listening automatically.
         """
-        import time as _time
-
         logger.debug("[health] Health reporter started")
         last_pushed = 0
         last_consumed = 0
         ticks_without_audio = 0
         RELISTEN_COOLDOWN = 5.0  # seconds between re-listen attempts
+        STARTUP_GRACE = 5.0     # seconds before relisten watchdog activates
+        startup_time = _time.monotonic()
 
         while self.is_connected:
             try:
@@ -752,6 +941,15 @@ class VoiceHandler:
                 except Exception:
                     pass
 
+                now = _time.monotonic()
+
+                # Compute age of last audio packet for liveness reporting
+                audio_age = (
+                    now - self._last_audio_received_time
+                    if self._last_audio_received_time > 0
+                    else -1.0
+                )
+
                 logger.debug(
                     f"[health] session={self._session_id} "
                     f"state={self._state.value} "
@@ -764,23 +962,32 @@ class VoiceHandler:
                     f"drops={h['total_drops']} "
                     f"gemini={gemini_state} "
                     f"speech={h['speech_detected']} "
+                    f"audio_age={audio_age:.1f}s "
                     f"ask_q={self._ask_queue.qsize()}"
                 )
 
                 # --- Listen recovery watchdog ---
-                if (
+                # Only activate after startup grace period to let the reader
+                # stabilize and avoid disrupting a partially working listener.
+                elapsed_since_start = now - startup_time
+                listener_seems_dead = (
                     not listening
+                    and (audio_age > 3.0 or audio_age < 0)  # stale packets OR never received any
+                )
+                if (
+                    listener_seems_dead
+                    and elapsed_since_start >= STARTUP_GRACE
                     and self._voice_client
                     and self._voice_client.is_connected()
                     and self._state in (BotState.LISTENING, BotState.PROCESSING)
                 ):
-                    now = _time.monotonic()
                     if (now - self._last_relisten_time) >= RELISTEN_COOLDOWN:
                         self._relisten_count += 1
                         self._last_relisten_time = now
                         logger.warning(
                             f"[health] Listener is dead! Re-establishing listening "
-                            f"(attempt #{self._relisten_count}) [session={self._session_id}]"
+                            f"(attempt #{self._relisten_count}) "
+                            f"[session={self._session_id}, audio_age={audio_age:.1f}s]"
                         )
                         try:
                             self._start_listening()

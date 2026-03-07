@@ -175,8 +175,13 @@ class WakeWordDetector:
                     self._user_models[user_id] = model
                     logger.info(f"Assigned pre-warmed wake word model to user {user_id} (pool remaining: {len(self._prewarmed_models)})")
                     
-                    # Asynchronously replenish the pool
-                    asyncio.get_event_loop().call_soon(self._prewarm_models)
+                    # Replenish the pool in the inference thread pool
+                    # (NOT call_soon, which blocks the event loop during
+                    # ONNX model loading).
+                    executor = _get_inference_executor()
+                    asyncio.get_event_loop().run_in_executor(
+                        executor, self._prewarm_models
+                    )
                 else:
                     # Fall back to creating a new model (has load latency)
                     from openwakeword.model import Model
