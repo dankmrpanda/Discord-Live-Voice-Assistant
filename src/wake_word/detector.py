@@ -2,11 +2,12 @@
 
 import asyncio
 import concurrent.futures
+import logging
 import threading
 from typing import Optional, Callable, Awaitable, Dict, Tuple
 import numpy as np
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 
 logger = get_logger("wake_word.detector")
 
@@ -130,8 +131,7 @@ class WakeWordDetector:
             logger.error("Install with: pip install openwakeword")
             raise
         except Exception as e:
-            logger.error(f"Failed to load wake word model: {e}")
-            logger.debug(f"Model load error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Failed to load wake word model", e)
             raise
     
     def _prewarm_models(self) -> None:
@@ -154,7 +154,7 @@ class WakeWordDetector:
                     self._prewarmed_models.append(model)
                 logger.info(f"Pre-warmed {models_to_create} models (total pool: {len(self._prewarmed_models)})")
         except Exception as e:
-            logger.warning(f"Failed to pre-warm models: {e}")
+            log_exception(logger, "Failed to pre-warm models", e, level=logging.WARNING)
     
     def _get_or_create_user_model(self, user_id: int) -> object:
         """Get or create a model instance for a specific user.
@@ -191,7 +191,7 @@ class WakeWordDetector:
                 self._user_last_scores[user_id] = {}
                 
             except Exception as e:
-                logger.error(f"Failed to create model for user {user_id}: {e}")
+                log_exception(logger, f"Failed to create model for user {user_id}", e)
                 # Fall back to shared model
                 return self._model
         
@@ -334,7 +334,7 @@ class WakeWordDetector:
         try:
             prediction = await loop.run_in_executor(executor, predict_with_lock)
         except Exception as e:
-            logger.error(f"Error running wake word prediction for user {user_id}: {e}")
+            log_exception(logger, f"Error running wake word prediction for user {user_id}", e)
             return False
         
         self._user_last_scores[user_id] = prediction

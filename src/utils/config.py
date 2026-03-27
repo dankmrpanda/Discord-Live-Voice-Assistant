@@ -2,10 +2,13 @@
 
 import os
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, List, Any
 from dotenv import load_dotenv
+
+logger = logging.getLogger("utils.config")
 
 
 @dataclass
@@ -265,8 +268,8 @@ class Config:
             for listener in self._change_listeners:
                 try:
                     listener(self, changed_fields)
-                except Exception:
-                    pass  # Don't let listener errors break reload
+                except Exception as e:
+                    logger.warning(f"Config change listener error: {e}")
         
         return changed_fields
     

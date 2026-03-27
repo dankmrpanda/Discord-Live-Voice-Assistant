@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 from typing import Optional
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 from ..utils.config import Config, ConfigWatcher
 from .voice_handler import VoiceHandler, BotState
 
@@ -170,7 +170,7 @@ class DiscordBot(commands.Bot):
                         ephemeral=True,
                     )
             except Exception as e:
-                logger.error(f"Error processing /ask command: {e}")
+                log_exception(logger, "Error processing /ask command", e)
                 await ctx.followup.send(
                     "An error occurred while processing your request. Please try again.",
                     ephemeral=True,
@@ -449,7 +449,7 @@ class DiscordBot(commands.Bot):
                 except Exception:
                     pass
                 del self._voice_handlers[guild_id]
-            logger.error(f"Exception joining voice channel: {e}")
+            log_exception(logger, "Exception joining voice channel", e)
             return False, f"Error joining voice channel: {str(e)}"
         finally:
             # Always remove from joining set when done

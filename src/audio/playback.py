@@ -7,7 +7,7 @@ from typing import Optional, Callable
 
 import discord
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 from .processor import AudioProcessor
 
 logger = get_logger("audio.playback")
@@ -263,13 +263,13 @@ class AudioPlayback:
         
         def after_playback(error):
             if error:
-                logger.error(f"Playback error: {error}")
+                log_exception(logger, "Playback error", error)
             self._is_playing = False
             if self._playback_complete_event:
                 self._playback_complete_event.set()
             if self._after_callback:
                 self._after_callback()
-        
+
         # Start playback
         self._voice_client.play(source, after=after_playback)
         logger.debug(f"Started playback of {len(discord_pcm)} bytes")
@@ -336,7 +336,7 @@ class AudioPlayback:
         
         def after_playback(error):
             if error:
-                logger.error(f"Streaming playback error: {error}")
+                log_exception(logger, "Streaming playback error", error)
             self._is_playing = False
             self._is_streaming = False
             self._streaming_source = None

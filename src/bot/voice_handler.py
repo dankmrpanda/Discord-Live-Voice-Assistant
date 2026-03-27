@@ -1,12 +1,13 @@
 """Voice handler with state machine for managing voice interactions."""
 
 import asyncio
+import logging
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
 import discord
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 from ..audio.capture import AudioCapture
 from ..audio.playback import AudioPlayback
 from ..audio.processor import AudioProcessor
@@ -229,7 +230,7 @@ class VoiceHandler:
                 logger.info("✓ Gemini client updated (will connect when joining voice)")
                 
         except Exception as e:
-            logger.error(f"Error reconnecting Gemini: {e}")
+            log_exception(logger, "Error reconnecting Gemini", e)
     
     def _setup_callbacks(self) -> None:
         """Set up callbacks between components."""
@@ -256,17 +257,20 @@ class VoiceHandler:
             # Process wake word detection for this specific user
             await self._wake_detector.process_audio_for_user(audio_data, user_id)
     
-    async def _on_recording_finished(self, sink, channel, *args) -> None:
+    def _on_recording_finished(self, exception: Exception = None) -> None:
         """Handle recording finished event.
-        
+
         This is called when stop_recording() is called or the bot disconnects.
-        
+        py-cord 2.8 passes a single exception parameter (or None on clean stop).
+
         Args:
-            sink: The sink that was recording.
-            channel: The channel that was being recorded.
+            exception: Exception that caused recording to stop, or None.
         """
-        logger.info(f"Recording finished for channel: {channel}")
-        sink.cleanup()
+        if exception:
+            logger.warning(f"Recording finished with error: {exception}")
+        else:
+            logger.info("Recording finished")
+        self._sink.cleanup()
     
     @property
     def state(self) -> BotState:
@@ -290,48 +294,67 @@ class VoiceHandler:
             self._state = new_state
             logger.info(f"State transition: {old_state.value} -> {new_state.value}")
     
+    async def _cleanup_partial_voice_client(self, guild: discord.Guild) -> None:
+        """Disconnect and clean up a partially-connected voice client."""
+        try:
+            if self._voice_client is not None:
+                await self._voice_client.disconnect(force=True)
+        except Exception:
+            pass
+        # Also remove any lingering voice client on the guild
+        try:
+            if guild.voice_client is not None:
+                await guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+        self._voice_client = None
+
     async def _wait_for_voice_ready(self, timeout: float = 10.0) -> bool:
         """Wait for the voice connection to be fully ready.
-        
-        With py-cord 2.7+, the connect() method should return a properly
-        connected voice client. This method provides a small grace period
-        and verifies the connection is stable.
-        
+
+        Uses py-cord 2.8+'s built-in wait_until_connected() when available,
+        falling back to polling is_connected() for older versions.
+
         Args:
             timeout: Maximum time to wait for connection (seconds).
-            
+
         Returns:
             True if connection is ready, False if timed out or failed.
         """
         if not self._voice_client:
             return False
-        
-        start_time = asyncio.get_event_loop().time()
-        check_interval = 0.5
-        
+
         logger.debug(f"Verifying voice connection (timeout={timeout}s)")
-        
-        # Give the connection a moment to settle after connect() returns
-        await asyncio.sleep(0.5)
-        
-        while (asyncio.get_event_loop().time() - start_time) < timeout:
+
+        # py-cord 2.8+ provides wait_until_connected()
+        if hasattr(self._voice_client, 'wait_until_connected'):
             try:
-                if self._voice_client is None:
-                    logger.warning("Voice client was destroyed during verification")
-                    return False
-                
-                # Check if the voice client is connected
-                if self._voice_client.is_connected():
-                    logger.info("Voice connection verified successfully")
-                    return True
-                
-                logger.debug("Waiting for voice connection...")
-                await asyncio.sleep(check_interval)
-                
+                result = self._voice_client.wait_until_connected(timeout=timeout)
+                # Handle both sync and async versions
+                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                    ready = await result
+                else:
+                    ready = result
+                if ready:
+                    logger.info("Voice connection verified via wait_until_connected()")
+                else:
+                    logger.warning(f"Voice connection not ready after {timeout}s")
+                return ready
             except Exception as e:
-                logger.warning(f"Error checking voice connection status: {e}")
-                await asyncio.sleep(check_interval)
-        
+                log_exception(logger, "Error waiting for voice connection", e, level=logging.WARNING)
+                return False
+
+        # Fallback for older py-cord versions
+        start_time = asyncio.get_event_loop().time()
+        await asyncio.sleep(1.0)
+        while (asyncio.get_event_loop().time() - start_time) < timeout:
+            if self._voice_client is None:
+                return False
+            if self._voice_client.is_connected():
+                logger.info("Voice connection verified successfully")
+                return True
+            await asyncio.sleep(0.5)
+
         logger.warning(f"Voice connection verification timed out after {timeout}s")
         return False
     
@@ -357,23 +380,46 @@ class VoiceHandler:
             self._connection_ready.clear()
             self._connection_failed.clear()
             
-            # Connect to voice channel
-            # py-cord 2.7+ has fixed the voice connection issues
-            logger.debug("Connecting to voice channel...")
-            try:
-                self._voice_client = await asyncio.wait_for(
-                    channel.connect(timeout=60.0, reconnect=True),
-                    timeout=65.0
-                )
-            except asyncio.TimeoutError:
-                logger.error("Voice channel connection timed out")
-                raise Exception("Connection to voice channel timed out")
-            
-            logger.debug(f"Voice client obtained: {self._voice_client}")
-            
-            # Verify the connection is ready
-            if not await self._wait_for_voice_ready(timeout=10.0):
-                raise Exception("Voice connection verification failed")
+            # Connect to voice channel with retry logic.
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                logger.debug(f"Connecting to voice channel (attempt {attempt}/{max_attempts})...")
+                try:
+                    self._voice_client = await asyncio.wait_for(
+                        channel.connect(timeout=30.0, reconnect=True),
+                        timeout=35.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Voice connection attempt {attempt} timed out")
+                    await self._cleanup_partial_voice_client(channel.guild)
+                    if attempt == max_attempts:
+                        raise Exception("Voice channel connection timed out after all retries")
+                    await asyncio.sleep(2.0)
+                    continue
+                except Exception as e:
+                    logger.warning(f"Voice connection attempt {attempt} failed: {e}")
+                    await self._cleanup_partial_voice_client(channel.guild)
+                    if attempt == max_attempts:
+                        raise
+                    await asyncio.sleep(2.0)
+                    continue
+
+                logger.debug(f"Voice client obtained: {self._voice_client}")
+
+                # Verify the connection is actually ready
+                if await self._wait_for_voice_ready(timeout=10.0):
+                    break
+
+                # Verification failed — clean up and retry
+                logger.warning(f"Voice connection verification failed on attempt {attempt}")
+                await self._cleanup_partial_voice_client(channel.guild)
+                self._voice_client = None
+                if attempt == max_attempts:
+                    raise Exception("Voice connection verification failed after all retries")
+                await asyncio.sleep(2.0)
+
+            if not self._voice_client or not self._voice_client.is_connected():
+                raise Exception("Voice connection not established")
             
             logger.info("Voice connection is ready")
             
@@ -389,12 +435,14 @@ class VoiceHandler:
             logger.debug("Enabling wake word detection")
             self._wake_detector.enable()
             
+            # Ensure the sink has the event loop for cross-thread scheduling
+            self._sink.set_loop(asyncio.get_running_loop())
+
             # Start recording with our custom sink to receive audio
             logger.debug("Starting voice recording with WakeWordSink")
             self._voice_client.start_recording(
                 self._sink,
                 self._on_recording_finished,
-                channel,
             )
             logger.info("Voice recording started - now receiving audio from Discord")
             
@@ -402,9 +450,17 @@ class VoiceHandler:
             logger.debug("Starting audio receive loop")
             self._audio_loop_task = asyncio.create_task(self._audio_receive_loop())
             
-            # Connect to Gemini
+            # Connect to Gemini (with timeout to prevent /join from hanging)
             logger.debug("Connecting to Gemini Live API")
-            await self._gemini.connect()
+            try:
+                gemini_connected = await asyncio.wait_for(
+                    self._gemini.connect(),
+                    timeout=20.0,
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Gemini connection timed out")
+            if not gemini_connected:
+                raise Exception("Failed to connect to Gemini API")
             logger.debug("Gemini connection established")
             
             # Start Gemini health check / keep-alive task
@@ -418,7 +474,7 @@ class VoiceHandler:
             return True
             
         except Exception as e:
-            logger.error(f"Failed to join voice channel: {e}")
+            log_exception(logger, "Failed to join voice channel", e)
             await self.leave_channel()
             return False
     
@@ -437,12 +493,15 @@ class VoiceHandler:
                     break
         
         # Stop recording first (before disabling other components)
-        if self._voice_client and self._voice_client.recording:
+        is_recording = (self._voice_client and
+                        (self._voice_client.is_recording() if hasattr(self._voice_client, 'is_recording')
+                         else getattr(self._voice_client, 'recording', False)))
+        if is_recording:
             try:
                 logger.debug("Stopping voice recording")
                 self._voice_client.stop_recording()
             except Exception as e:
-                logger.warning(f"Error stopping recording: {e}")
+                log_exception(logger, "Error stopping recording", e, level=logging.WARNING)
         
         # Stop components first
         self._wake_detector.disable()
@@ -502,7 +561,7 @@ class VoiceHandler:
                 if self._voice_client.is_connected():
                     await self._voice_client.disconnect(force=True)
             except Exception as e:
-                logger.warning(f"Error disconnecting voice client: {e}")
+                log_exception(logger, "Error disconnecting voice client", e, level=logging.WARNING)
             self._voice_client = None
         
         # Clear target channel
@@ -540,7 +599,7 @@ class VoiceHandler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in audio receive loop: {e}")
+                log_exception(logger, "Error in audio receive loop", e)
                 await asyncio.sleep(0.1)
     
     async def _on_wake_word_detected(self, user_id: int) -> None:
@@ -624,8 +683,8 @@ class VoiceHandler:
             try:
                 await self._send_task
             except Exception as e:
-                logger.error(f"Error in send loop: {e}")
-            
+                log_exception(logger, "Error in send loop", e)
+
             # Phase 2: Start streaming playback (will buffer until chunks arrive)
             playback_started = self._playback.start_streaming_playback()
             if not playback_started:
@@ -641,8 +700,8 @@ class VoiceHandler:
             try:
                 await self._receive_task
             except Exception as e:
-                logger.error(f"Error in receive loop: {e}")
-            
+                log_exception(logger, "Error in receive loop", e)
+
             # Cleanup
             self._is_capturing_for_gemini = False
             self._capture.stop_streaming_to_gemini()
@@ -659,9 +718,7 @@ class VoiceHandler:
             self._is_capturing_for_gemini = False
             self._capture.stop_streaming_to_gemini()
         except Exception as e:
-            logger.error(f"❌ Error in streaming pipeline: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            log_exception(logger, "Error in streaming pipeline", e)
             self._is_capturing_for_gemini = False
             self._capture.stop_streaming_to_gemini()
             await self._reset_to_listening()
@@ -732,7 +789,7 @@ class VoiceHandler:
         except asyncio.CancelledError:
             logger.debug("Send loop cancelled")
         except Exception as e:
-            logger.error(f"Error in send loop: {e}")
+            log_exception(logger, "Error in send loop", e)
         finally:
             # Signal end of audio input
             elapsed = time.time() - capture_start
@@ -791,7 +848,7 @@ class VoiceHandler:
         except asyncio.CancelledError:
             logger.debug("Receive loop cancelled")
         except Exception as e:
-            logger.error(f"Error in receive loop: {e}")
+            log_exception(logger, "Error in receive loop", e)
         finally:
             # Mark streaming as complete
             self._playback.finish_streaming()
@@ -907,7 +964,7 @@ class VoiceHandler:
             return True
             
         except Exception as e:
-            logger.error(f"Error starting text prompt processing: {e}")
+            log_exception(logger, "Error starting text prompt processing", e)
             await self._reset_to_listening()
             return False
     
@@ -1083,10 +1140,11 @@ class VoiceHandler:
             self._receive_task = asyncio.create_task(self._receive_response_loop())
             
             # Wait for both to complete
-            try:
-                await asyncio.gather(self._send_task, self._receive_task)
-            except Exception as e:
-                logger.error(f"Error in text prompt pipeline: {e}")
+            results = await asyncio.gather(self._send_task, self._receive_task, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    task_name = "send" if i == 0 else "receive"
+                    log_exception(logger, f"Error in {task_name} task", result)
             
             # Wait for playback to complete
             logger.debug("Waiting for playback to complete...")
@@ -1098,9 +1156,7 @@ class VoiceHandler:
         except asyncio.CancelledError:
             logger.debug("Text prompt pipeline cancelled")
         except Exception as e:
-            logger.error(f"❌ Error in text prompt pipeline: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            log_exception(logger, "Error in text prompt pipeline", e)
             await self._reset_to_listening()
     
     async def _send_text_prompt(self, prompt: str) -> None:
@@ -1114,7 +1170,7 @@ class VoiceHandler:
             await self._gemini.send_text(prompt)
             logger.info("📤 Text prompt sent successfully")
         except Exception as e:
-            logger.error(f"Error sending text prompt: {e}")
+            log_exception(logger, "Error sending text prompt", e)
             self._streaming_complete.set()
     
     async def handle_audio_packet(

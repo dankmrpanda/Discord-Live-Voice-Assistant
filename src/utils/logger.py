@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -104,3 +105,63 @@ def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(full_name)
     _loggers[name] = logger
     return logger
+
+
+def _extract_error_details(exc: Exception) -> str:
+    """Extract structured details from known exception types using duck-typing."""
+    parts = []
+
+    # google-genai API errors (APIError, ClientError, ServerError)
+    if hasattr(exc, "code") and hasattr(exc, "status") and hasattr(exc, "details"):
+        parts.append(f"code={exc.code}")
+        if getattr(exc, "status", None):
+            parts.append(f"status={exc.status}")
+        if getattr(exc, "message", None):
+            parts.append(f"api_message={exc.message}")
+        if getattr(exc, "details", None):
+            parts.append(f"details={exc.details}")
+
+    # websockets ConnectionClosed (has code + reason, but no status)
+    elif hasattr(exc, "code") and hasattr(exc, "reason") and not hasattr(exc, "status"):
+        parts.append(f"ws_code={exc.code}")
+        if getattr(exc, "reason", None):
+            parts.append(f"ws_reason={exc.reason!r}")
+
+    # discord HTTPException (has status + code + text)
+    elif hasattr(exc, "status") and hasattr(exc, "code") and hasattr(exc, "text"):
+        parts.append(f"http_status={exc.status}")
+        parts.append(f"discord_code={exc.code}")
+        if getattr(exc, "text", None):
+            parts.append(f"text={exc.text}")
+
+    # Fallback: repr often contains more info than str
+    if not parts:
+        raw_repr = repr(exc)
+        raw_str = str(exc)
+        if raw_repr != raw_str and raw_repr != f"{type(exc).__name__}({raw_str!r})":
+            parts.append(f"repr={raw_repr}")
+
+    return ", ".join(parts)
+
+
+def log_exception(
+    lgr: logging.Logger,
+    msg: str,
+    exc: Exception,
+    *,
+    level: int = logging.ERROR,
+) -> None:
+    """Log an exception with full raw context at the specified level.
+
+    Extracts structured fields from known exception types (google-genai API
+    errors, WebSocket close errors, Discord HTTP errors) and always logs the
+    full traceback so the session log file has complete debugging context.
+    """
+    exc_type = type(exc).__name__
+    details = _extract_error_details(exc)
+    detail_str = f" | {details}" if details else ""
+    lgr.log(level, f"{msg}: [{exc_type}] {exc}{detail_str}")
+
+    tb = traceback.format_exc()
+    if tb and tb.strip() != "NoneType: None":
+        lgr.log(level, f"Traceback for '{msg}':\n{tb}")

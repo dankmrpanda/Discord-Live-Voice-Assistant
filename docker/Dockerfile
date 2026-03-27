@@ -29,15 +29,17 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Download OpenWakeWord models
+# THE FIX: Download models as ROOT so they can be written to the site-packages directory
 RUN python -c "import openwakeword; openwakeword.utils.download_models()"
 
 # Copy source code
 COPY src/ ./src/
 
-# Create non-root user for security
+# Create non-root user for security and take ownership of /app
 RUN useradd --create-home --shell /bin/bash botuser && \
     chown -R botuser:botuser /app
+
+# Switch to non-root user for execution
 USER botuser
 
 # Run the bot

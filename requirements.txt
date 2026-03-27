@@ -1,8 +1,7 @@
-# Discord (using py-cord development version for voice fix)
-# See: https://github.com/Pycord-Development/pycord/issues/2833
-# The fix is in PR #2812, included in 2.7.0rc1+
-git+https://github.com/Pycord-Development/pycord.git@master#egg=py-cord[voice]
-PyNaCl>=1.5.0
+# Discord - 2.8.0rc1 required for DAVE voice encryption support
+# See: https://github.com/Pycord-Development/pycord/issues/3135
+py-cord[voice]==2.8.0rc1
+PyNaCl>=1.6.0,<1.7
 
 # Google Gemini
 google-genai>=0.8.0

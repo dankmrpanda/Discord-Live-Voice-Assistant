@@ -3,12 +3,16 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      network: host
     container_name: discord-live-vc-bot
     restart: unless-stopped
     env_file:
       - ../.env
     environment:
       - PYTHONUNBUFFERED=1
+      - GODEBUG=netdns=go
+    # THE FIX: Bypasses Docker's bridge network and Alpine's iptables firewall
+    network_mode: "host"
     volumes:
       # Mount source for development (optional, comment out in production)
       - ../src:/app/src:ro
@@ -16,16 +20,10 @@ services:
       - ../config.yaml:/app/config.yaml:ro
       # Mount logs directory
       - ../logs:/app/logs
-    networks:
-      - bot-network
     # No ports needed - bot connects outbound to Discord
     healthcheck:
-      test: ["CMD", "python", "-c", "import discord; print('healthy')"]
+      test: [ "CMD", "python", "-c", "import discord; print('healthy')" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
-networks:
-  bot-network:
-    driver: bridge

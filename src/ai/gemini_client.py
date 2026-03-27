@@ -1,11 +1,12 @@
 """Gemini Live API client for real-time voice interaction."""
 
 import asyncio
+import logging
 import time
 from enum import Enum
 from typing import Optional, Callable, Awaitable, AsyncIterator, List
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 
 logger = get_logger("ai.gemini")
 
@@ -22,6 +23,8 @@ class GeminiSessionState(Enum):
 # Health check / keep-alive configuration
 HEALTH_CHECK_INTERVAL_S = 30.0  # Check connection health every 30 seconds
 MAX_CONSECUTIVE_ERRORS = 3  # Reconnect after 3 consecutive errors
+GEMINI_CONNECT_TIMEOUT_S = 15.0  # Timeout for WebSocket connection
+GEMINI_SEND_TIMEOUT_S = 5.0  # Timeout for send operations
 
 
 class GeminiLiveClient:
@@ -201,7 +204,7 @@ class GeminiLiveClient:
                 logger.debug("Health check loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"Health check loop error: {e}")
+                log_exception(logger, "Health check loop error", e)
                 await asyncio.sleep(5.0)  # Brief pause before retrying
 
         logger.debug("Health check loop ended")
@@ -268,7 +271,7 @@ class GeminiLiveClient:
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Gemini reconnection error: {e}")
+            log_exception(logger, "Gemini reconnection error", e)
             self._record_error()
             return False
 
@@ -405,7 +408,16 @@ class GeminiLiveClient:
                 model=self.model,
                 config=config,
             )
-            self._session = await self._session_manager.__aenter__()
+            try:
+                self._session = await asyncio.wait_for(
+                    self._session_manager.__aenter__(),
+                    timeout=GEMINI_CONNECT_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError as e:
+                log_exception(logger, f"Gemini WebSocket connection timed out after {GEMINI_CONNECT_TIMEOUT_S}s", e)
+                self._state = GeminiSessionState.ERROR
+                self._record_error()
+                return False
             connect_time = time.time() - connect_start
 
             self._state = GeminiSessionState.CONNECTED
@@ -416,8 +428,7 @@ class GeminiLiveClient:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to connect to Gemini: {e}")
-            logger.debug(f"Connection error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Failed to connect to Gemini", e)
             self._state = GeminiSessionState.ERROR
             self._record_error()  # Track connection failure
             return False
@@ -428,7 +439,7 @@ class GeminiLiveClient:
             try:
                 await self._session_manager.__aexit__(None, None, None)
             except Exception as e:
-                logger.warning(f"Error closing session: {e}")
+                log_exception(logger, "Error closing session", e, level=logging.WARNING)
 
         self._session = None
         self._session_manager = None
@@ -482,20 +493,25 @@ class GeminiLiveClient:
             )
 
             # Official pattern: use media=Blob(...) :contentReference[oaicite:4]{index=4}
-            await self._session.send_realtime_input(
-                media=types.Blob(
-                    mime_type="audio/pcm;rate=16000",
-                    data=audio_data,
-                )
+            await asyncio.wait_for(
+                self._session.send_realtime_input(
+                    media=types.Blob(
+                        mime_type="audio/pcm;rate=16000",
+                        data=audio_data,
+                    )
+                ),
+                timeout=GEMINI_SEND_TIMEOUT_S,
             )
 
             self._state = GeminiSessionState.STREAMING
             self._update_activity()  # Mark successful send
             logger.debug("Audio sent successfully")
 
+        except asyncio.TimeoutError as e:
+            log_exception(logger, f"Timed out sending audio after {GEMINI_SEND_TIMEOUT_S}s", e)
+            self._record_error()
         except Exception as e:
-            logger.error(f"Error sending audio: {e}")
-            logger.debug(f"Send audio error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Error sending audio", e)
             self._record_error()  # Track send failure
 
     async def send_text(self, text: str) -> None:
@@ -512,18 +528,23 @@ class GeminiLiveClient:
             # IMPORTANT: `turns` should be a *Content object*, not a list.
             # Passing a list is one of the common causes of 1007 invalid-argument
             # because it doesn't match the expected schema. :contentReference[oaicite:5]{index=5}
-            await self._session.send_client_content(
-                turns=types.Content(
-                    role="user",
-                    parts=[types.Part(text=text)],
+            await asyncio.wait_for(
+                self._session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part(text=text)],
+                    ),
+                    turn_complete=True,
                 ),
-                turn_complete=True,
+                timeout=GEMINI_SEND_TIMEOUT_S,
             )
             logger.debug("Text turn sent successfully")
 
+        except asyncio.TimeoutError as e:
+            log_exception(logger, f"Timed out sending text after {GEMINI_SEND_TIMEOUT_S}s", e)
+            self._record_error()
         except Exception as e:
-            logger.error(f"Error sending text: {e}")
-            logger.debug(f"Send text error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Error sending text", e)
 
     async def end_turn(self) -> None:
         """Signal end of audio input and request a response.
@@ -543,8 +564,7 @@ class GeminiLiveClient:
             await self._session.send_realtime_input(audio_stream_end=True)
             logger.debug("audio_stream_end sent successfully")
         except Exception as e:
-            logger.error(f"Error ending turn: {e}")
-            logger.debug(f"End turn error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Error ending turn", e)
 
     # --------------------------------------------------------------------- #
     # Receiving data
@@ -647,22 +667,19 @@ class GeminiLiveClient:
                     break
 
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Error receiving response: {e}")
-            logger.debug(f"Receive error details: {type(e).__name__}: {e}")
-            import traceback
+            log_exception(logger, "Error receiving Gemini response", e)
 
-            logger.debug(traceback.format_exc())
-
-            # 1007 invalid frame payload generally means we sent an invalid
-            # request (bad schema, wrong field types, etc.), and the server
-            # closed the WebSocket. We mark the session as ERROR so the
-            # caller can reconnect cleanly.
-            if "1007" in error_msg or "invalid frame payload" in error_msg.lower():
-                logger.warning(
-                    "WebSocket 1007 / invalid payload detected, "
-                    "marking session for reconnection"
-                )
+            # Detect WebSocket close codes structurally instead of string matching
+            ws_code = getattr(e, "code", None)
+            ws_reason = getattr(e, "reason", None)
+            if ws_code is not None and ws_reason is not None:
+                if ws_code == 1007:
+                    logger.warning(
+                        f"WebSocket 1007 (invalid payload) - code={ws_code}, "
+                        f"reason={ws_reason!r}, marking session for reconnection"
+                    )
+                else:
+                    logger.warning(f"WebSocket closed: code={ws_code}, reason={ws_reason!r}")
 
             self._state = GeminiSessionState.ERROR
             self._record_error()  # Track receive failure
@@ -703,8 +720,7 @@ class GeminiLiveClient:
             return await self.get_full_audio_response()
 
         except Exception as e:
-            logger.error(f"Error processing voice request: {e}")
-            logger.debug(f"process_voice_request error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Error processing voice request", e)
             self._state = GeminiSessionState.ERROR
             return None
 
