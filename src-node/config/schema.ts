@@ -15,6 +15,7 @@ export const appConfigSchema = z.object({
   discordGuildId: z.string().optional(),
 
   geminiApiKey: z.string().min(1),
+  picovoiceAccessKey: z.string().min(1).optional(),
   geminiVoice: z.string().default("Puck"),
   geminiModel: z.string().default("gemini-2.0-flash-live-001"),
   geminiThinking: boolish.default(false),

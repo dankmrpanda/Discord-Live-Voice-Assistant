@@ -10,13 +10,17 @@
 # ------------------------------------------------------------
 wake_word:
   # The phrase that activates the bot
-  # Available built-in models:
-  #   - hey_jarvis    (recommended - works well)
-  #   - alexa         (Amazon Alexa wake word)
-  #   - hey_mycroft   (Mycroft assistant)
-  #   - timer         (detects "timer" keyword)
-  #   - weather       (detects "weather" keyword)
-  # You can also specify a path to a custom .onnx model file
+  # Supported built-in phrases:
+  #   - hey_jarvis    (mapped to Porcupine's jarvis keyword)
+  #   - jarvis
+  #   - alexa
+  #   - hey_google
+  #   - ok_google
+  #   - hey_siri
+  #   - computer
+  #   - picovoice
+  #   - porcupine
+  # You can also specify a path to a custom .ppn model file
   phrase: "hey_jarvis"
   
   # Detection sensitivity (0.0 to 1.0)

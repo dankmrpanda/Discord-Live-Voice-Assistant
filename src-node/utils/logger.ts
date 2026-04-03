@@ -10,9 +10,11 @@ const REDACT_PATHS = [
   "discordBotToken",
   "discordApplicationId",
   "geminiApiKey",
+  "picovoiceAccessKey",
   "*.discordBotToken",
   "*.discordApplicationId",
   "*.geminiApiKey",
+  "*.picovoiceAccessKey",
 ];
 
 export function createLogger(level: string, directory: string): Logger {

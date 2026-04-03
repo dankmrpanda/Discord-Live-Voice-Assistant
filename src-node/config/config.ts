@@ -25,7 +25,7 @@ interface RawYaml {
     gemini_output_sample_rate?: number;
     playback_buffer_ms?: number;
   };
-  logging?: { level?: "debug" | "info" | "warn" | "error"; directory?: string; log_audio?: boolean };
+  logging?: { level?: "trace" | "debug" | "info" | "warn" | "error" | "fatal"; directory?: string; log_audio?: boolean };
   system_prompt?: string;
 }
 
@@ -108,6 +108,7 @@ export class ConfigManager {
       discordApplicationId: process.env.DISCORD_APPLICATION_ID,
       discordGuildId: process.env.DISCORD_GUILD_ID,
       geminiApiKey: process.env.GEMINI_API_KEY,
+      picovoiceAccessKey: process.env.PICOVOICE_ACCESS_KEY,
 
       wakePhrase: yaml.wake_word?.phrase ?? "hey_jarvis",
       wakeWordThreshold: yaml.wake_word?.threshold ?? 0.5,

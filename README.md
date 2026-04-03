@@ -7,6 +7,7 @@ A Discord voice assistant built with Node.js, `discord.js`, `@discordjs/voice`, 
 - FFmpeg in PATH (recommended for voice playback stability)
 - Discord bot token
 - Gemini API key
+- Picovoice AccessKey (required for wake-word detection)
 
 ## Setup
 1. Install dependencies:
@@ -71,5 +72,7 @@ scripts/
 ```
 
 ## Notes
-- Wake-word detection is currently disabled in the Node runtime.
-- Use `/ask` for interaction.
+- Wake-word detection uses Picovoice Porcupine in the Node runtime.
+- Set `PICOVOICE_ACCESS_KEY` in `.env` to enable wake-word detection.
+- Supported built-in wake phrases: `hey_jarvis` (mapped to `jarvis`), `jarvis`, `alexa`, `hey_google`, `ok_google`, `hey_siri`, `computer`, `picovoice`, `porcupine`.
+- You can also use an absolute or relative path to a custom `.ppn` keyword model file.

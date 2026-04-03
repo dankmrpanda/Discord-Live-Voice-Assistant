@@ -57,7 +57,11 @@ export class VoiceHandler {
       await this.onPcmChunk(userId, pcm48kStereo);
     });
     this.gemini = new GeminiLiveClient(config);
-    this.wakeWord = createWakeWordAdapter();
+    this.wakeWord = createWakeWordAdapter({
+      wakePhrase: config.wakePhrase,
+      wakeWordThreshold: config.wakeWordThreshold,
+      picovoiceAccessKey: config.picovoiceAccessKey,
+    });
     this.wakeWord.setDetectionCallback(async (userId) => {
       await this.onWakeWordDetected(userId);
     });
@@ -67,6 +71,11 @@ export class VoiceHandler {
     this.config = config;
     this.capture.setSilenceThreshold(config.silenceThreshold);
     this.playback.setBufferMs(config.playbackBufferMs);
+    this.wakeWord.updateConfig({
+      wakePhrase: config.wakePhrase,
+      wakeWordThreshold: config.wakeWordThreshold,
+      picovoiceAccessKey: config.picovoiceAccessKey,
+    });
     logger.info(
       {
         silenceThreshold: config.silenceThreshold,
@@ -256,6 +265,7 @@ export class VoiceHandler {
       this.activeUserId = null;
       this.capture.setActiveUser(null);
     }
+    this.wakeWord.cleanupUser(member.id);
   }
 
   private async onPcmChunk(userId: string, pcm48kStereo: Buffer): Promise<void> {

@@ -17,6 +17,7 @@ export interface AppConfig {
   discordApplicationId?: string;
   discordGuildId?: string;
   geminiApiKey: string;
+  picovoiceAccessKey?: string;
 
   wakePhrase: string;
   wakeWordThreshold: number;
