@@ -61,8 +61,9 @@ Until then, use `/ask` to interact with Jarvis via text.
 - **Function Calling** — Extensible tool support (framework ready for your custom tools)
 - **Hot Reload** — Configuration changes apply without restart
 
-### 💻 Runtime
-- **Docker (glibc base)** — Recommended on Alpine hosts for reliable ONNX/OpenWakeWord support
+### 🐳 Deployment Options
+- **Docker** — Production-ready containerization
+- **Local Development** — Run directly with Python
 
 ---
 
@@ -72,17 +73,7 @@ Until then, use `/ask` to interact with Jarvis via text.
 |-------------|---------|
 | Python | 3.11+ |
 | FFmpeg | Latest |
-| Docker Engine + Compose Plugin | Latest |
-
-Alpine base packages (example):
-
-```bash
-apk add --no-cache python3 py3-pip ffmpeg libsndfile
-apk add --no-cache build-base linux-headers python3-dev  # for source builds if wheels are unavailable
-apk add --no-cache py3-onnxruntime  # Alpine ONNX runtime for openwakeword (available on newer branches like v3.23+/edge)
-```
-
-If your Alpine branch does not provide `py3-onnxruntime` (for example, v3.21), use a glibc runtime (Debian/Ubuntu, typically via Docker) for this project.
+| Docker & Docker Compose | Latest (optional) |
 
 ### API Keys Required
 - **Discord Bot Token** — [Discord Developer Portal](https://discord.com/developers/applications)
@@ -109,28 +100,30 @@ GEMINI_API_KEY=your_gemini_api_key
 EOF
 ```
 
-### 3. Run with Docker (Recommended for Alpine Hosts)
+### 3. Run with Docker (Recommended)
 
 ```bash
-# Build and start (host networking mode is configured in compose)
-docker compose -f docker/docker-compose.yml up --build -d
-
-# View logs
-docker compose -f docker/docker-compose.yml logs -f
-
-# Stop
-docker compose -f docker/docker-compose.yml down
+cd docker
+docker-compose up --build
 ```
 
-Logs are written to the project-local `./logs` folder (mounted to `/app/logs` in the container).
-OpenWakeWord model assets are downloaded/cached in a separate project-local `./openwakeword_models` folder (mounted to `/app/openwakeword_models`).
-
-If you see `PermissionError` writing `/app/logs/...`, fix host folder ownership once:
+### 4. Run Locally (Development)
 
 ```bash
-mkdir -p logs
-mkdir -p openwakeword_models
-sudo chown -R "$(id -u):$(id -g)" logs openwakeword_models
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run Jarvis
+python -m src.main
 ```
 
 ---
@@ -228,9 +221,6 @@ gemini:
 behavior:
   capture_duration: 7.0    # Max seconds to record after wake word
   silence_threshold: 1.0   # Seconds of silence to end capture
-  gemini_first_chunk_timeout: 30.0  # Max wait for first response audio chunk
-  gemini_chunk_idle_timeout: 8.0    # Max gap between response chunks
-  gemini_max_turn_duration: 90.0    # Hard cap per response turn (0 disables)
 
 # Customize Jarvis's personality
 system_prompt: |
@@ -351,8 +341,8 @@ All above voices plus:
 ```
 discord-live-vc-bot/
 ├── docker/
-│   ├── Dockerfile           # Debian/glibc runtime image
-│   └── docker-compose.yml   # Host-network compose for voice reliability
+│   ├── Dockerfile           # Production container
+│   └── docker-compose.yml   # Container orchestration
 ├── src/
 │   ├── __init__.py
 │   ├── main.py              # Entry point & startup
@@ -450,6 +440,7 @@ Once DAVE receive is fixed:
 
 - **Never commit `.env`** — It's in `.gitignore` by default
 - API keys are only stored in `.env` (not in `config.yaml`)
+- Docker container runs as non-root user (`botuser`)
 - Jarvis only accesses voice channels it's invited to
 
 ---
@@ -463,8 +454,7 @@ MIT License — See [LICENSE](LICENSE) for details.
 ## 🙏 Acknowledgments
 
 - [OpenWakeWord](https://github.com/dscripka/openWakeWord) — Wake word detection
-- [discord.py](https://discordpy.readthedocs.io/) — Discord API library
-- [discord-ext-voice-recv](https://github.com/imayhaveborkedit/discord-ext-voice-recv) — Voice receive support for discord.py
+- [Pycord](https://pycord.dev/) — Discord API library
 - [Google Gemini](https://ai.google.dev/) — AI and voice synthesis
 - **Marvel/Iron Man** — For the inspiration behind J.A.R.V.I.S.
 

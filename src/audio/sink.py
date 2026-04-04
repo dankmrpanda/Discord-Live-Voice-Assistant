@@ -1,17 +1,10 @@
-"""Discord voice receive sink for wake word detection."""
+"""Custom Discord audio sink for wake word detection with per-user audio processing."""
 
 import asyncio
 from typing import Optional, Callable, Awaitable, TYPE_CHECKING, Dict
-
 import discord
-from discord.ext import voice_recv
 
 from ..utils.logger import get_logger
-
-try:
-    import davey
-except ImportError:  # pragma: no cover - discord.py voice requires davey at runtime
-    davey = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .capture import AudioCapture
@@ -83,6 +76,7 @@ class WakeWordSink(_SinkBase):
         *,
         capture: Optional["AudioCapture"] = None,
         audio_callback: Optional[Callable[[bytes, int], Awaitable[None]]] = None,
+        filters=None,
     ):
         """Initialize the wake word sink.
         
@@ -101,13 +95,11 @@ class WakeWordSink(_SinkBase):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._chunk_count = 0
         self._per_user_chunk_count: Dict[int, int] = {}
-        self._opus_decoders: Dict[int, discord.opus.Decoder] = {}
-        self._decode_error_count: Dict[int, int] = {}
-
+        
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Sink writes occur in a background thread, loop may not exist yet.
+            # No running loop yet, will be set later
             pass
         
         logger.info("WakeWordSink initialized (per-user audio processing enabled)")
@@ -126,15 +118,23 @@ class WakeWordSink(_SinkBase):
         logger.debug("Event loop explicitly set on sink")
 
     def set_capture(self, capture: "AudioCapture") -> None:
-        """Set the audio capture instance."""
+        """Set the audio capture instance.
+        
+        Args:
+            capture: AudioCapture instance to receive audio.
+        """
         self._capture = capture
         logger.debug("AudioCapture set on sink")
-
+    
     def set_audio_callback(
         self,
         callback: Optional[Callable[[bytes, int], Awaitable[None]]],
     ) -> None:
-        """Set callback for raw audio data."""
+        """Set callback for raw audio data.
+        
+        Args:
+            callback: Async function to call with raw audio bytes and user ID.
+        """
         self._audio_callback = callback
 
     @_FiltersContainer
@@ -231,14 +231,31 @@ class WakeWordSink(_SinkBase):
                 logger.error(f"Error scheduling audio callback for user {user_id}: {e}")
     
     def cleanup(self) -> None:
-        """Clean up sink resources."""
+        """Clean up the sink resources."""
         logger.info(f"WakeWordSink cleanup - processed {self._chunk_count} total audio chunks")
         for user_id, count in self._per_user_chunk_count.items():
             logger.debug(f"  User {user_id}: {count} chunks")
         self._per_user_chunk_count.clear()
-        self._opus_decoders.clear()
-        self._decode_error_count.clear()
-
-    def get_active_users(self) -> list[int]:
-        """Get users who have sent audio in this sink session."""
+        self.finished = True
+    
+    def get_all_audio(self):
+        """Get all recorded audio (required by Sink interface).
+        
+        We don't store audio, so this returns empty list.
+        """
+        return []
+    
+    def format_audio(self, audio):
+        """Format audio (required by Sink interface).
+        
+        We process audio in real-time, so this is a no-op.
+        """
+        pass
+    
+    def get_active_users(self) -> list:
+        """Get list of users who have sent audio.
+        
+        Returns:
+            List of user IDs that have sent audio.
+        """
         return list(self._per_user_chunk_count.keys())

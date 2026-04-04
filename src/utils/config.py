@@ -43,9 +43,6 @@ class Config:
     # Bot Behavior
     capture_duration: float = 5.0
     silence_threshold: float = 0.5
-    gemini_first_chunk_timeout: float = 30.0
-    gemini_chunk_idle_timeout: float = 8.0
-    gemini_max_turn_duration: float = 90.0
     
     # System Prompt
     system_prompt: str = ""
@@ -131,7 +128,7 @@ class Config:
         # Get system prompt
         system_prompt = yaml_config.get("system_prompt", cls._default_system_prompt())
         
-        config = cls(
+        return cls(
             discord_bot_token=discord_token,
             discord_application_id=os.getenv("DISCORD_APPLICATION_ID"),
             gemini_api_key=gemini_key,
@@ -145,9 +142,6 @@ class Config:
             wake_word_threshold=float(wake_threshold),
             capture_duration=behavior_config.get("capture_duration", 5.0),
             silence_threshold=behavior_config.get("silence_threshold", 0.5),
-            gemini_first_chunk_timeout=behavior_config.get("gemini_first_chunk_timeout", 30.0),
-            gemini_chunk_idle_timeout=behavior_config.get("gemini_chunk_idle_timeout", 8.0),
-            gemini_max_turn_duration=behavior_config.get("gemini_max_turn_duration", 90.0),
             system_prompt=system_prompt,
             log_level=log_level,
             log_directory=logging_config.get("directory", "logs"),
@@ -158,8 +152,6 @@ class Config:
             playback_buffer_ms=audio_config.get("playback_buffer_ms", 200),
             _config_path=resolved_config_path,
         )
-        config._validate()
-        return config
     
     def add_change_listener(self, listener: Callable[["Config", List[str]], Any]) -> None:
         """Add a listener that will be called when config changes.
@@ -169,55 +161,6 @@ class Config:
         """
         if listener not in self._change_listeners:
             self._change_listeners.append(listener)
-    
-    def _validate(self) -> None:
-        """Validate configuration field values and clamp to valid ranges.
-        
-        Logs warnings for out-of-range values and clamps them.
-        Raises ValueError for values that cannot be corrected.
-        """
-        VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-        
-        # Wake word threshold: clamp to [0.0, 1.0]
-        if self.wake_word_threshold < 0.0:
-            logger.warning("wake_word_threshold %.2f is below 0.0, clamping to 0.0", self.wake_word_threshold)
-            self.wake_word_threshold = 0.0
-        elif self.wake_word_threshold > 1.0:
-            logger.warning("wake_word_threshold %.2f is above 1.0, clamping to 1.0", self.wake_word_threshold)
-            self.wake_word_threshold = 1.0
-        
-        # Capture duration: must be positive
-        if self.capture_duration <= 0:
-            raise ValueError(f"capture_duration must be positive, got {self.capture_duration}")
-        
-        # Silence threshold: must be positive
-        if self.silence_threshold <= 0:
-            raise ValueError(f"silence_threshold must be positive, got {self.silence_threshold}")
-
-        # Gemini timeouts: first chunk + idle timeout must be positive
-        if self.gemini_first_chunk_timeout <= 0:
-            raise ValueError(
-                f"gemini_first_chunk_timeout must be positive, got {self.gemini_first_chunk_timeout}"
-            )
-        if self.gemini_chunk_idle_timeout <= 0:
-            raise ValueError(
-                f"gemini_chunk_idle_timeout must be positive, got {self.gemini_chunk_idle_timeout}"
-            )
-        # Max turn duration can be 0 (disabled) or positive
-        if self.gemini_max_turn_duration < 0:
-            raise ValueError(
-                f"gemini_max_turn_duration must be >= 0, got {self.gemini_max_turn_duration}"
-            )
-        
-        # Playback buffer: must be non-negative
-        if self.playback_buffer_ms < 0:
-            logger.warning("playback_buffer_ms %d is negative, clamping to 0", self.playback_buffer_ms)
-            self.playback_buffer_ms = 0
-        
-        # Log level: must be valid
-        if self.log_level.upper() not in VALID_LOG_LEVELS:
-            logger.warning("Invalid log_level '%s', defaulting to INFO", self.log_level)
-            self.log_level = "INFO"
     
     def remove_change_listener(self, listener: Callable[["Config", List[str]], Any]) -> None:
         """Remove a change listener.
@@ -287,9 +230,6 @@ class Config:
         behavior_config = yaml_config.get("behavior", {})
         new_capture_duration = behavior_config.get("capture_duration", 5.0)
         new_silence_threshold = behavior_config.get("silence_threshold", 0.5)
-        new_first_chunk_timeout = behavior_config.get("gemini_first_chunk_timeout", 30.0)
-        new_chunk_idle_timeout = behavior_config.get("gemini_chunk_idle_timeout", 8.0)
-        new_max_turn_duration = behavior_config.get("gemini_max_turn_duration", 90.0)
         
         if self.capture_duration != new_capture_duration:
             changed_fields.append("capture_duration")
@@ -297,15 +237,6 @@ class Config:
         if self.silence_threshold != new_silence_threshold:
             changed_fields.append("silence_threshold")
             self.silence_threshold = new_silence_threshold
-        if self.gemini_first_chunk_timeout != new_first_chunk_timeout:
-            changed_fields.append("gemini_first_chunk_timeout")
-            self.gemini_first_chunk_timeout = float(new_first_chunk_timeout)
-        if self.gemini_chunk_idle_timeout != new_chunk_idle_timeout:
-            changed_fields.append("gemini_chunk_idle_timeout")
-            self.gemini_chunk_idle_timeout = float(new_chunk_idle_timeout)
-        if self.gemini_max_turn_duration != new_max_turn_duration:
-            changed_fields.append("gemini_max_turn_duration")
-            self.gemini_max_turn_duration = float(new_max_turn_duration)
         
         # System prompt
         new_system_prompt = yaml_config.get("system_prompt", self._default_system_prompt())
@@ -334,7 +265,6 @@ class Config:
         
         # Notify listeners if there were changes
         if changed_fields:
-            self._validate()
             for listener in self._change_listeners:
                 try:
                     listener(self, changed_fields)
@@ -382,7 +312,6 @@ class Config:
             import yaml
         except ImportError:
             # If PyYAML not installed, return empty dict
-            logger.warning("PyYAML is not installed; config YAML will be ignored")
             return {}, None
         
         # Default paths to check
@@ -392,6 +321,7 @@ class Config:
             paths = [
                 Path("config.yaml"),
                 Path("config.yml"),
+                Path("/app/config.yaml"),  # Docker path
             ]
         
         for path in paths:
@@ -400,8 +330,8 @@ class Config:
                     with open(path, 'r', encoding='utf-8') as f:
                         config = yaml.safe_load(f)
                         return (config if config else {}, str(path.absolute()))
-                except Exception as exc:
-                    logger.warning("Failed to load config file '%s': %s", path, exc, exc_info=True)
+                except Exception:
+                    pass
         
         return {}, None
     
@@ -477,19 +407,19 @@ class ConfigWatcher:
                 try:
                     current_mtime = Path(self.config._config_path).stat().st_mtime
                 except (OSError, IOError):
-                    logger.debug("Config watcher could not stat file: %s", self.config._config_path)
                     continue
                 
                 if self._last_mtime is not None and current_mtime > self._last_mtime:
                     # File was modified, reload config
                     changed = self.config.reload()
                     if changed:
-                        logger.info("Config watcher detected changes: %s", ", ".join(changed))
+                        # Logging will be handled by the change listeners
+                        pass
                 
                 self._last_mtime = current_mtime
                 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
+            except Exception:
                 # Don't let watcher errors crash the bot
-                logger.error("Config watcher loop error: %s", exc, exc_info=True)
+                pass

@@ -46,7 +46,6 @@ def main() -> int:
         name="discord_bot",
         level=config.log_level,
         enable_debug_file=True,
-        log_directory=config.log_directory,
     )
     
     # Add config change listener for logging
@@ -63,23 +62,6 @@ def main() -> int:
     logger.debug(f"Python version: {sys.version}")
     logger.debug(f"Platform: {platform.platform()}")
     logger.debug(f"Machine: {platform.machine()}")
-    
-    # Log library versions for debugging
-    try:
-        import discord
-        logger.info(f"discord.py version: {discord.__version__}")
-    except Exception:
-        logger.warning("Could not determine discord.py version")
-    try:
-        from discord.ext import voice_recv
-        logger.info(f"discord-ext-voice-recv version: {getattr(voice_recv, '__version__', 'unknown')}")
-    except Exception:
-        logger.warning("Could not determine discord-ext-voice-recv version")
-    try:
-        import openwakeword
-        logger.info(f"openwakeword version: {openwakeword.__version__}")
-    except Exception:
-        logger.debug("openwakeword version not available at startup")
     
     # Log configuration sources
     config_file = Path("config.yaml")
@@ -110,7 +92,7 @@ def main() -> int:
     # Run the bot
     try:
         logger.info("Starting Discord bot connection...")
-        # discord.py uses the default logging setup from our logger config
+        # py-cord doesn't use log_handler argument
         bot.run(config.discord_bot_token)
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")

@@ -2,12 +2,10 @@
 
 import asyncio
 import io
-import threading
 from collections import deque
 from typing import Optional, Callable
 
 import discord
-import numpy as np
 
 from ..utils.logger import get_logger, log_exception
 from .processor import AudioProcessor
@@ -52,13 +50,7 @@ class PCMVolumeTransformer(discord.AudioSource):
         # Pad if needed
         if len(frame) < self._frame_size:
             frame += b"\x00" * (self._frame_size - len(frame))
-
-        # Apply volume scaling
-        if self._volume != 1.0:
-            samples = np.frombuffer(frame, dtype=np.int16)
-            scaled = np.clip(samples * self._volume, -32768, 32767).astype(np.int16)
-            frame = scaled.tobytes()
-
+        
         return frame
     
     def is_opus(self) -> bool:
@@ -93,9 +85,8 @@ class StreamingPCMSource(discord.AudioSource):
         self._volume = volume
         self._buffer = bytearray()
         self._chunk_queue: deque[bytes] = deque()
-        self._queued_bytes = 0
         self._is_finished = False
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
         
         # Buffer threshold: calculate bytes needed for buffer_ms at Discord's format
         # 48kHz * 2 bytes per sample * 2 channels = 192000 bytes per second
@@ -113,21 +104,18 @@ class StreamingPCMSource(discord.AudioSource):
         """
         # Convert to Discord format (48kHz stereo)
         discord_pcm = self._processor.gemini_to_discord(gemini_audio)
-        with self._lock:
-            self._chunk_queue.append(discord_pcm)
-            self._queued_bytes += len(discord_pcm)
+        self._chunk_queue.append(discord_pcm)
     
     def mark_finished(self) -> None:
         """Mark that no more chunks will be added."""
-        with self._lock:
-            self._is_finished = True
-            # Stop buffering when finished, even if threshold not reached
-            self._buffering = False
+        self._is_finished = True
+        # Stop buffering when finished, even if threshold not reached
+        self._buffering = False
     
     def _get_total_buffered(self) -> int:
         """Get total bytes currently buffered (buffer + queue)."""
-        with self._lock:
-            return len(self._buffer) + self._queued_bytes
+        queue_bytes = sum(len(chunk) for chunk in self._chunk_queue)
+        return len(self._buffer) + queue_bytes
     
     def pause(self) -> None:
         """Pause audio playback (returns silence instead of buffered audio)."""
@@ -165,35 +153,29 @@ class StreamingPCMSource(discord.AudioSource):
                 return b"\x00" * self.FRAME_SIZE
         
         # Fill buffer from queue if needed
-        with self._lock:
-            while len(self._buffer) < self.FRAME_SIZE and self._chunk_queue:
-                chunk = self._chunk_queue.popleft()
-                self._queued_bytes -= len(chunk)
-                self._buffer.extend(chunk)
-
-            # If buffer has enough data, return a frame
-            if len(self._buffer) >= self.FRAME_SIZE:
-                frame = bytes(self._buffer[:self.FRAME_SIZE])
-                del self._buffer[:self.FRAME_SIZE]
-            elif self._is_finished:
-                if len(self._buffer) > 0:
-                    frame = bytes(self._buffer)
-                    self._buffer.clear()
-                    if len(frame) < self.FRAME_SIZE:
-                        frame += b"\x00" * (self.FRAME_SIZE - len(frame))
-                else:
-                    return b""
-            else:
-                # Not finished but buffer empty - return silence to keep stream alive
-                return b"\x00" * self.FRAME_SIZE
-
-        # Apply volume scaling outside lock
-        if self._volume != 1.0:
-            samples = np.frombuffer(frame, dtype=np.int16)
-            scaled = np.clip(samples * self._volume, -32768, 32767).astype(np.int16)
-            frame = scaled.tobytes()
-
-        return frame
+        while len(self._buffer) < self.FRAME_SIZE and self._chunk_queue:
+            chunk = self._chunk_queue.popleft()
+            self._buffer.extend(chunk)
+        
+        # If buffer has enough data, return a frame
+        if len(self._buffer) >= self.FRAME_SIZE:
+            frame = bytes(self._buffer[:self.FRAME_SIZE])
+            del self._buffer[:self.FRAME_SIZE]
+            return frame
+        
+        # If finished and buffer has remaining data, pad and return
+        if self._is_finished:
+            if len(self._buffer) > 0:
+                frame = bytes(self._buffer)
+                self._buffer.clear()
+                # Pad to frame size
+                if len(frame) < self.FRAME_SIZE:
+                    frame += b"\x00" * (self.FRAME_SIZE - len(frame))
+                return frame
+            return b""
+        
+        # Not finished but buffer empty - return silence to keep stream alive
+        return b"\x00" * self.FRAME_SIZE
     
     def is_opus(self) -> bool:
         """Check if the audio source is Opus encoded."""

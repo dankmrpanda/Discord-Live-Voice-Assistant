@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-import traceback
 from enum import Enum
 from typing import Optional, Callable, Awaitable, AsyncIterator, List
 
@@ -323,6 +322,7 @@ class GeminiLiveClient:
 
         try:
             from google.genai import types
+            import time
 
             self._state = GeminiSessionState.CONNECTING
             logger.info("Connecting to Gemini Live API...")
@@ -427,12 +427,6 @@ class GeminiLiveClient:
             )
             return True
 
-        except asyncio.TimeoutError:
-            logger.error("Gemini connection timed out after 30s")
-            self._state = GeminiSessionState.ERROR
-            self._record_error()
-            return False
-
         except Exception as e:
             log_exception(logger, "Failed to connect to Gemini", e)
             self._state = GeminiSessionState.ERROR
@@ -457,7 +451,7 @@ class GeminiLiveClient:
     # Sending data
     # --------------------------------------------------------------------- #
 
-    async def send_audio(self, audio_data: bytes) -> bool:
+    async def send_audio(self, audio_data: bytes) -> None:
         """Send audio data to Gemini.
 
         Args:
@@ -470,11 +464,11 @@ class GeminiLiveClient:
             logger.warning(
                 f"Cannot send audio: session={self._session is not None}, state={self._state}"
             )
-            return False
+            return
 
         if not audio_data:
             logger.debug("Skipping empty audio chunk")
-            return True
+            return
 
         # Ensure audio data has even number of bytes (16-bit PCM = 2 bytes/sample)
         if len(audio_data) % 2 != 0:
@@ -488,7 +482,7 @@ class GeminiLiveClient:
             logger.debug(
                 f"Skipping small audio chunk ({len(audio_data)} bytes < {self.MIN_AUDIO_CHUNK_SIZE})"
             )
-            return True
+            return
 
         try:
             from google.genai import types
@@ -512,7 +506,6 @@ class GeminiLiveClient:
             self._state = GeminiSessionState.STREAMING
             self._update_activity()  # Mark successful send
             logger.debug("Audio sent successfully")
-            return True
 
         except asyncio.TimeoutError as e:
             log_exception(logger, f"Timed out sending audio after {GEMINI_SEND_TIMEOUT_S}s", e)
@@ -520,15 +513,14 @@ class GeminiLiveClient:
         except Exception as e:
             log_exception(logger, "Error sending audio", e)
             self._record_error()  # Track send failure
-            return False
 
-    async def send_text(self, text: str) -> bool:
+    async def send_text(self, text: str) -> None:
         """Send a text turn to Gemini (text-in, audio-out)."""
         if not self._session or not self.is_connected:
             logger.warning(
                 f"Cannot send text: session={self._session is not None}, connected={self.is_connected}"
             )
-            return False
+            return
 
         try:
             from google.genai import types
@@ -547,9 +539,6 @@ class GeminiLiveClient:
                 timeout=GEMINI_SEND_TIMEOUT_S,
             )
             logger.debug("Text turn sent successfully")
-            self._state = GeminiSessionState.STREAMING
-            self._update_activity()
-            return True
 
         except asyncio.TimeoutError as e:
             log_exception(logger, f"Timed out sending text after {GEMINI_SEND_TIMEOUT_S}s", e)
@@ -557,7 +546,7 @@ class GeminiLiveClient:
         except Exception as e:
             log_exception(logger, "Error sending text", e)
 
-    async def end_turn(self) -> bool:
+    async def end_turn(self) -> None:
         """Signal end of audio input and request a response.
 
         For audio conversations, the recommended pattern is to send
@@ -568,13 +557,12 @@ class GeminiLiveClient:
             logger.warning(
                 f"Cannot end turn: session={self._session is not None}, connected={self.is_connected}"
             )
-            return False
+            return
 
         try:
             logger.debug("Sending audio_stream_end signal to Gemini")
             await self._session.send_realtime_input(audio_stream_end=True)
             logger.debug("audio_stream_end sent successfully")
-            return True
         except Exception as e:
             log_exception(logger, "Error ending turn", e)
 
@@ -593,6 +581,8 @@ class GeminiLiveClient:
             return
 
         try:
+            import time
+
             self._audio_buffer.clear()
             logger.debug("Starting to receive responses from Gemini")
             receive_start = time.time()
@@ -639,15 +629,10 @@ class GeminiLiveClient:
                         await self._text_callback(text)
 
                 # 2) Output audio transcription (if enabled in config)
-                transcription = None
-                if server_content:
-                    transcription = getattr(server_content, "output_transcription", None)
-                    if transcription is None:
-                        # Backward-compat for older SDK field name.
-                        transcription = getattr(server_content, "output_audio_transcription", None)
-
-                if transcription:
-                    oat = transcription
+                if server_content and getattr(
+                    server_content, "output_audio_transcription", None
+                ):
+                    oat = server_content.output_audio_transcription
                     # Shape is OutputAudioTranscription; keep this robust.
                     transcript_text = None
                     try:
@@ -669,16 +654,9 @@ class GeminiLiveClient:
                         if self._text_callback:
                             await self._text_callback(transcript_text)
 
-                # ---- Turn lifecycle debug flags ----
-                if server_content and getattr(server_content, "generation_complete", False):
-                    logger.debug("Gemini signaled generation_complete")
-                if server_content and getattr(server_content, "interrupted", False):
-                    logger.warning("Gemini turn was interrupted before completion")
-
                 # ---- Turn completion ----
                 if server_content and getattr(server_content, "turn_complete", False):
                     elapsed = time.time() - receive_start
-                    self._state = GeminiSessionState.CONNECTED
                     self._update_activity()  # Mark successful response completion
                     logger.info(
                         f"Gemini response complete: {chunk_count} chunks, "
@@ -736,12 +714,8 @@ class GeminiLiveClient:
                 if not ok:
                     return None
 
-            sent = await self.send_audio(audio_data)
-            if not sent:
-                return None
-            ended = await self.end_turn()
-            if not ended:
-                return None
+            await self.send_audio(audio_data)
+            await self.end_turn()
 
             return await self.get_full_audio_response()
 

@@ -1,27 +1,39 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
-WORKDIR /app
-
-# Runtime deps for audio + build deps for packages with C extensions.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ffmpeg \
-        libsndfile1 \
-        build-essential \
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libopus0 \
+    libopus-dev \
+    libffi-dev \
+    libnacl-dev \
+    libsndfile1 \
+    portaudio19-dev \
+    gcc \
+    g++ \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # THE FIX: Download models as ROOT so they can be written to the site-packages directory
 RUN python -c "import openwakeword; openwakeword.utils.download_models()"
 
-RUN useradd --create-home --shell /usr/sbin/nologin botuser \
-    && chown -R botuser:botuser /app
+# Copy source code
+COPY src/ ./src/
 
 # Create non-root user for security and take ownership of /app
 RUN useradd --create-home --shell /bin/bash botuser && \
