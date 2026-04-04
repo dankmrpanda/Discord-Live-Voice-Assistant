@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, Callable, List, Any
 from dotenv import load_dotenv
 
-logger = logging.getLogger("discord_bot.utils.config")
+logger = logging.getLogger("utils.config")
 
 
 @dataclass
@@ -338,9 +338,8 @@ class Config:
             for listener in self._change_listeners:
                 try:
                     listener(self, changed_fields)
-                except Exception as exc:
-                    # Don't let listener errors break reload.
-                    logger.warning("Config change listener failed: %s", exc, exc_info=True)
+                except Exception as e:
+                    logger.warning(f"Config change listener error: {e}")
         
         return changed_fields
     

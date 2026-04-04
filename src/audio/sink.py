@@ -18,9 +18,65 @@ if TYPE_CHECKING:
 
 logger = get_logger("audio.sink")
 
+# Resolve Sink base class — py-cord moved sinks between versions.
+# Older py-cord: discord.sinks.Sink
+# Newer py-cord (master/3.x): discord.voice.receive.AudioSink or similar
+# We also handle the case where discord.py is installed instead of py-cord.
+_SinkBase = None
+_FiltersContainer = None
 
-class WakeWordSink(voice_recv.AudioSink):
-    """Receive per-user Discord PCM audio and forward it to AudioCapture."""
+if hasattr(discord, 'sinks'):
+    _SinkBase = discord.sinks.Sink
+    _FiltersContainer = discord.sinks.Filters.container
+else:
+    # py-cord master may have restructured — try alternate import paths
+    try:
+        from discord.sinks import Sink as _SinkBase, Filters
+        _FiltersContainer = Filters.container
+    except ImportError:
+        pass
+
+if _SinkBase is None:
+    # Fallback: define a minimal base class so the module can still load.
+    # Audio recording won't work, but the bot won't crash on import.
+    logger.error(
+        "Could not find discord.sinks.Sink — py-cord[voice] may not be installed correctly. "
+        "Audio recording will not work. Install with: "
+        "pip install git+https://github.com/Pycord-Development/pycord.git@master#egg=py-cord[voice]"
+    )
+
+    class _FallbackSink:
+        """Minimal stub so WakeWordSink can be defined without crashing."""
+        def __init__(self, **kwargs):
+            self.finished = False
+
+    _SinkBase = _FallbackSink
+
+if _FiltersContainer is None:
+    # No-op decorator fallback
+    def _FiltersContainer(func):
+        return func
+
+
+class WakeWordSink(_SinkBase):
+    """Custom sink that receives Discord audio and processes per-user wake word detection.
+
+    This sink receives raw PCM audio from Discord voice connections and
+    forwards it to the AudioCapture system for per-user processing.
+    Each user's audio is processed separately to enable proper wake word
+    detection with 3+ users in the voice channel.
+    """
+
+    # Required by py-cord 2.8's SinkEventRouter
+    __sink_listeners__: list = []
+
+    def walk_children(self):
+        """Yield child sinks (none for this sink)."""
+        return iter([])
+
+    def is_opus(self) -> bool:
+        """We want decoded PCM, not raw Opus."""
+        return False
 
     def __init__(
         self,
@@ -28,7 +84,18 @@ class WakeWordSink(voice_recv.AudioSink):
         capture: Optional["AudioCapture"] = None,
         audio_callback: Optional[Callable[[bytes, int], Awaitable[None]]] = None,
     ):
-        super().__init__()
+        """Initialize the wake word sink.
+        
+        Args:
+            capture: AudioCapture instance to receive audio.
+            audio_callback: Optional async callback for raw audio data (data, user_id).
+            filters: Optional filters for the sink.
+        """
+        try:
+            super().__init__(filters=filters)
+        except TypeError:
+            # Fallback base class doesn't accept filters
+            super().__init__()
         self._capture = capture
         self._audio_callback = audio_callback
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -42,12 +109,21 @@ class WakeWordSink(voice_recv.AudioSink):
         except RuntimeError:
             # Sink writes occur in a background thread, loop may not exist yet.
             pass
+        
+        logger.info("WakeWordSink initialized (per-user audio processing enabled)")
+    
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Explicitly set the event loop for cross-thread audio scheduling.
 
-        logger.info("WakeWordSink initialized (voice_recv)")
+        Must be called from the asyncio thread before recording starts,
+        since write() is called from Discord's audio thread where
+        get_running_loop() will always fail.
 
-    def wants_opus(self) -> bool:
-        """Request Opus frames and decode manually with DAVE-aware logic."""
-        return True
+        Args:
+            loop: The asyncio event loop to schedule coroutines on.
+        """
+        self._loop = loop
+        logger.debug("Event loop explicitly set on sink")
 
     def set_capture(self, capture: "AudioCapture") -> None:
         """Set the audio capture instance."""
@@ -61,125 +137,99 @@ class WakeWordSink(voice_recv.AudioSink):
         """Set callback for raw audio data."""
         self._audio_callback = callback
 
-    def _ensure_loop(self) -> Optional[asyncio.AbstractEventLoop]:
-        if self._loop is not None:
-            return self._loop
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        return self._loop
+    @_FiltersContainer
+    def write(self, data, user) -> None:
+        """Receive audio data from Discord for a specific user.
 
-    def _decrypt_opus_for_user(self, user_id: int, opus_payload: bytes) -> bytes:
-        """Decrypt DAVE-wrapped Opus payload when available."""
-        if not opus_payload:
-            return b""
+        This method is called by Discord's voice system when audio is received.
+        The @Filters.container decorator handles user filtering.
+        Audio is processed PER-USER to enable proper wake word detection
+        even with multiple users speaking.
 
-        if davey is None:
-            return opus_payload
+        Note: py-cord master passes VoiceData objects (with .pcm attribute) and
+        Member objects (with .id attribute), not raw bytes and int user IDs.
+        We handle both old and new API formats for compatibility.
 
-        voice_client = getattr(self, "voice_client", None)
-        connection = getattr(voice_client, "_connection", None)
-        dave_session = getattr(connection, "dave_session", None)
-        if dave_session is None or not getattr(dave_session, "ready", False):
-            return opus_payload
+        Args:
+            data: VoiceData object or raw PCM audio bytes (48kHz, 16-bit, stereo).
+            user: Member/User object or integer user ID.
+        """
+        # --- Extract raw PCM bytes from data ---
+        # py-cord master: data is a VoiceData object with .pcm attribute
+        # py-cord older: data is raw bytes
+        if hasattr(data, 'pcm'):
+            pcm_data = data.pcm
+        elif isinstance(data, (bytes, bytearray)):
+            pcm_data = bytes(data)
+        else:
+            try:
+                pcm_data = bytes(data)
+            except (TypeError, ValueError):
+                logger.error(f"Cannot extract PCM from data type {type(data).__name__}, skipping")
+                return
 
-        try:
-            decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, opus_payload)
-        except Exception as exc:
-            # Decrypt errors can happen around transitions. Fall back to original payload.
-            count = self._decode_error_count.get(user_id, 0) + 1
-            self._decode_error_count[user_id] = count
-            if count == 1 or count % 50 == 0:
-                logger.warning(
-                    f"DAVE decrypt failed for user {user_id} ({count} errors): {exc}"
-                )
-            return opus_payload
-
-        if isinstance(decrypted, (bytes, bytearray, memoryview)):
-            return bytes(decrypted)
-        return opus_payload
-
-    def _decode_opus_for_user(self, user_id: int, opus_payload: bytes) -> Optional[bytes]:
-        """Decode Opus to PCM and drop corrupt frames instead of killing the listener."""
-        if not opus_payload:
-            return None
-
-        decoder = self._opus_decoders.get(user_id)
-        if decoder is None:
-            decoder = discord.opus.Decoder()
-            self._opus_decoders[user_id] = decoder
-
-        try:
-            return decoder.decode(opus_payload, fec=False)
-        except Exception as exc:
-            count = self._decode_error_count.get(user_id, 0) + 1
-            self._decode_error_count[user_id] = count
-            if count == 1 or count % 50 == 0:
-                logger.warning(
-                    f"Dropping corrupted Opus frame for user {user_id} ({count} errors): {exc}"
-                )
-            return None
-
-    def _get_pcm_payload(self, user_id: int, data: voice_recv.VoiceData) -> Optional[bytes]:
-        """Extract PCM payload from VoiceData, supporting both PCM and Opus modes."""
-        # Compatibility path for tests or environments where PCM is already present.
-        pcm_data = getattr(data, "pcm", None)
-        if isinstance(pcm_data, (bytes, bytearray, memoryview)) and pcm_data:
-            return bytes(pcm_data)
-
-        opus_data = getattr(data, "opus", None)
-        if not isinstance(opus_data, (bytes, bytearray, memoryview)) or not opus_data:
-            return None
-
-        decrypted_opus = self._decrypt_opus_for_user(user_id, bytes(opus_data))
-        return self._decode_opus_for_user(user_id, decrypted_opus)
-
-    def write(self, user: discord.Member | discord.User | None, data: voice_recv.VoiceData) -> None:
-        """Receive Discord voice frames and enqueue async processing."""
-        if user is None:
-            return
-
-        user_id = user.id
-        payload = self._get_pcm_payload(user_id, data)
-        if not payload:
-            return
+        # --- Extract integer user ID ---
+        # py-cord master: user is a Member/User object with .id attribute
+        # py-cord older: user is an integer
+        if hasattr(user, 'id'):
+            user_id = user.id
+        elif isinstance(user, int):
+            user_id = user
+        else:
+            try:
+                user_id = int(user)
+            except (TypeError, ValueError):
+                logger.error(f"Cannot extract user ID from type {type(user).__name__}, skipping")
+                return
 
         self._chunk_count += 1
-        self._per_user_chunk_count[user_id] = self._per_user_chunk_count.get(user_id, 0) + 1
 
-        if self._per_user_chunk_count[user_id] == 1:
+        # Log type info on first chunk for diagnostics
+        if self._chunk_count == 1:
             logger.info(
-                f"First audio chunk from user {user_id}: {len(payload)} bytes (Discord audio flowing)"
-            )
-        elif self._per_user_chunk_count[user_id] % 500 == 1:
-            logger.debug(
-                f"Audio chunk #{self._per_user_chunk_count[user_id]} from user {user_id}: {len(payload)} bytes"
+                f"First audio chunk: data_type={type(data).__name__}, "
+                f"pcm_size={len(pcm_data)}, user_type={type(user).__name__}, "
+                f"user_id={user_id}"
             )
 
-        loop = self._ensure_loop()
-        if loop is None:
-            logger.warning("No event loop available, cannot process audio")
-            return
+        # Track per-user chunk counts
+        if user_id not in self._per_user_chunk_count:
+            self._per_user_chunk_count[user_id] = 0
+            logger.info(f"New user detected in voice: {user_id}")
+        self._per_user_chunk_count[user_id] += 1
 
+        # Log occasionally (per user)
+        if self._per_user_chunk_count[user_id] % 500 == 1:
+            logger.debug(f"Audio chunk #{self._per_user_chunk_count[user_id]} from user {user_id}: {len(pcm_data)} bytes")
+
+        # Schedule async processing in the event loop
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning("No event loop available, cannot process audio")
+                return
+
+        # Process audio asynchronously - PER USER
         if self._capture is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    self._capture.process_discord_audio_per_user(payload, user_id, is_stereo=True),
-                    loop,
+                    self._capture.process_discord_audio_per_user(pcm_data, user_id, is_stereo=True),
+                    self._loop,
                 )
-            except Exception as exc:
-                logger.error(f"Error scheduling audio processing for user {user_id}: {exc}")
+            except Exception as e:
+                logger.error(f"Error scheduling audio processing for user {user_id}: {e}")
 
+        # Call raw audio callback if set (now includes user ID)
         if self._audio_callback is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    self._audio_callback(payload, user_id),
-                    loop,
+                    self._audio_callback(pcm_data, user_id),
+                    self._loop,
                 )
-            except Exception as exc:
-                logger.error(f"Error scheduling audio callback for user {user_id}: {exc}")
-
+            except Exception as e:
+                logger.error(f"Error scheduling audio callback for user {user_id}: {e}")
+    
     def cleanup(self) -> None:
         """Clean up sink resources."""
         logger.info(f"WakeWordSink cleanup - processed {self._chunk_count} total audio chunks")

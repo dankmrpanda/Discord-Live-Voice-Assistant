@@ -7,9 +7,11 @@
 **A real-time AI voice assistant for Discord — inspired by Tony Stark's legendary AI companion**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Discord.py](https://img.shields.io/badge/discord.py-2.7.1-5865F2.svg)](https://discordpy.readthedocs.io/)
+[![Discord.py](https://img.shields.io/badge/discord-py--cord%202.8.0rc1-5865F2.svg)](https://pycord.dev/)
 [![Gemini](https://img.shields.io/badge/AI-Gemini%20Live-4285F4.svg)](https://ai.google.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![DAVE Status](https://img.shields.io/badge/DAVE%20send-✅%20working-brightgreen.svg)](https://github.com/Pycord-Development/pycord/pull/3143)
+[![DAVE Receive](https://img.shields.io/badge/DAVE%20receive-⚠️%20pending-orange.svg)](https://github.com/Pycord-Development/pycord/issues/3139)
 
 *"Good evening, sir. I've prepared the voice channel for your arrival."*
 
@@ -17,10 +19,28 @@
 
 ---
 
+## ⚠️ Current Status — Discord DAVE Encryption
+
+On **March 2, 2026**, Discord enforced end-to-end encryption (DAVE protocol) on all voice calls.
+This requires **py-cord 2.8.0rc1+**, which is now in use.
+
+| Feature | Status |
+|---|---|
+| Connect to voice channel | ✅ Working |
+| Play audio (Gemini responses via `/ask`) | ✅ Working |
+| Wake word detection (voice receive) | ⚠️ Pending DAVE receive support in py-cord |
+
+**Wake word detection is temporarily unavailable.** Voice receive through sinks is not yet
+implemented for DAVE-encrypted channels. Track progress at
+[pycord#3139](https://github.com/Pycord-Development/pycord/issues/3139).
+Until then, use `/ask` to interact with Jarvis via text.
+
+---
+
 ## ✨ Features
 
 ### 🎤 Voice Interaction
-- **"Hey Jarvis" Wake Word** — Activate with the iconic wake phrase, powered by [OpenWakeWord](https://github.com/dscripka/openWakeWord)
+- **"Hey Jarvis" Wake Word** — Activate with the iconic wake phrase, powered by [OpenWakeWord](https://github.com/dscripka/openWakeWord) *(temporarily unavailable — see status above)*
 - **Real-Time Speech-to-Speech** — Low-latency voice conversations using Gemini Live API's bidirectional audio streaming
 - **Multi-User Support** — Per-user audio processing and wake word detection, even with 3+ users in the channel
 - **Voice Activity Detection (VAD)** — Intelligent speech detection with configurable silence thresholds
@@ -365,8 +385,8 @@ discord-live-vc-bot/
 ### Core Libraries
 | Package | Purpose |
 |---------|---------|
-| [discord.py](https://discordpy.readthedocs.io/) | Discord API runtime |
-| [discord-ext-voice-recv](https://github.com/imayhaveborkedit/discord-ext-voice-recv) | Discord voice receive extension |
+| [py-cord 2.8.0rc1](https://pycord.dev/) | Discord API — required for DAVE voice encryption ([PR #3143](https://github.com/Pycord-Development/pycord/pull/3143)) |
+| [davey](https://pypi.org/project/davey/) | Discord DAVE/OpenMLS encryption (auto-installed with py-cord[voice]) |
 | [google-genai](https://pypi.org/project/google-genai/) | Gemini Live API client |
 | [openwakeword](https://github.com/dscripka/openWakeWord) | Wake word detection |
 | [webrtcvad](https://pypi.org/project/webrtcvad/) | Voice activity detection |
@@ -385,32 +405,26 @@ discord-live-vc-bot/
 | PyYAML | Config file parsing |
 | python-dotenv | Environment variables |
 | aiohttp | Async HTTP |
-| PyNaCl | Voice encryption |
+| PyNaCl 1.6.x | Voice encryption (1.6+ required for py-cord 2.8) |
 
 ---
 
 ## 🔍 Troubleshooting
 
-### Docker on Alpine (nftables/iptables)
+### Jarvis Can't Hear Users / Wake Word Not Working
 
-- This repo's compose file uses `network_mode: host` to avoid Docker bridge/NAT iptables paths that can break Discord voice traffic on Alpine hosts.
-- The compose build also uses `build.network: host` so `apt/pip` DNS resolution follows the host resolver.
-- Host networking is Linux-only. Run with:
-  - `docker compose -f docker/docker-compose.yml up --build -d`
-- If voice still fails on Alpine VM, verify Docker is not forced to bridge mode and that host UDP traffic is unrestricted.
+> **Note:** As of py-cord 2.8.0rc1, voice receive is broken due to Discord's DAVE
+> encryption enforcement (March 2, 2026). Wake word detection will not work until
+> py-cord adds DAVE receive support. Use `/ask` in the meantime.
+> Track: [pycord#3139](https://github.com/Pycord-Development/pycord/issues/3139)
 
-### Jarvis Can't Hear Users
+Once DAVE receive is fixed:
 
 1. ✅ Ensure Jarvis has **"Use Voice Activity"** permission
 2. ✅ Check that users aren't server-muted or self-deafened
 3. ✅ Verify Jarvis is properly connected (check `/status`)
-
-### Wake Word Not Detecting
-
-1. ⬇️ Lower the `threshold` in `config.yaml` (try `0.3` or `0.2`)
-2. 🎤 Speak clearly: *"Hey Jarvis"*
-3. 🔊 Ensure your microphone is working in Discord
-4. 📊 Enable `log_audio: true` in config for debugging
+4. ⬇️ Lower the `threshold` in `config.yaml` (try `0.3` or `0.2`)
+5. 📊 Enable `log_audio: true` in config for debugging
 
 ### High Latency or Stuttering
 

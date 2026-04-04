@@ -2,14 +2,13 @@
 
 import asyncio
 import concurrent.futures
-import os
-from pathlib import Path
+import logging
 import threading
 import wave
 from typing import Optional, Callable, Awaitable, Dict, Tuple
 import numpy as np
 
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, log_exception
 
 logger = get_logger("wake_word.detector")
 
@@ -173,8 +172,7 @@ class WakeWordDetector:
             logger.error("Install with: pip install openwakeword")
             raise
         except Exception as e:
-            logger.error(f"Failed to load wake word model: {e}")
-            logger.debug(f"Model load error details: {type(e).__name__}: {e}")
+            log_exception(logger, "Failed to load wake word model", e)
             raise
 
     def _prepare_model_assets(self, openwakeword, requested_model: str) -> tuple[str, dict]:
@@ -362,7 +360,7 @@ class WakeWordDetector:
                     self._prewarmed_models.append(model)
                 logger.info(f"Pre-warmed {models_to_create} models (total pool: {len(self._prewarmed_models)})")
         except Exception as e:
-            logger.warning(f"Failed to pre-warm models: {e}")
+            log_exception(logger, "Failed to pre-warm models", e, level=logging.WARNING)
     
     def _run_model_self_test(self) -> None:
         """Run a self-test to verify the model can detect wake words.
@@ -660,7 +658,7 @@ class WakeWordDetector:
                 self._user_last_scores[user_id] = {}
                 
             except Exception as e:
-                logger.error(f"Failed to create model for user {user_id}: {e}")
+                log_exception(logger, f"Failed to create model for user {user_id}", e)
                 # Fall back to shared model
                 return self._model
         
@@ -848,10 +846,7 @@ class WakeWordDetector:
         try:
             prediction, diag_info = await loop.run_in_executor(executor, predict_with_lock)
         except Exception as e:
-            # Log but don't spam - ONNX dimension errors can occur on edge-case
-            # audio chunks; the model will recover on the next valid chunk
-            if chunk_num % 50 == 1:
-                logger.warning(f"Wake word prediction error for user {user_id} (chunk #{chunk_num}): {e}")
+            log_exception(logger, f"Error running wake word prediction for user {user_id}", e)
             return False
         
         self._user_last_scores[user_id] = prediction
