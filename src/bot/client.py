@@ -1,6 +1,7 @@
-"""Discord bot client with slash commands (py-cord version)."""
+﻿"""Discord bot client with app commands (discord.py version)."""
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from typing import Optional
 
@@ -38,6 +39,7 @@ class DiscordBot(commands.Bot):
         self.config = config
         self._voice_handlers: dict[int, VoiceHandler] = {}  # guild_id -> handler
         self._joining_guilds: set[int] = set()  # guilds currently in join process
+        self._leaving_guilds: set[int] = set()  # guilds currently in explicit leave flow
         self._config_watcher: Optional[ConfigWatcher] = None
         logger.debug("DiscordBot initialization complete")
         
@@ -45,32 +47,47 @@ class DiscordBot(commands.Bot):
         self._register_commands()
     
     def _register_commands(self) -> None:
-        """Register slash commands with the bot."""
-        
-        @self.slash_command(name="join", description="Join your current voice channel")
-        async def join_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to join a voice channel."""
-            if not ctx.author.voice or not ctx.author.voice.channel:
-                await ctx.respond("You need to be in a voice channel first!", ephemeral=True)
+        """Register slash commands with discord.py app command tree."""
+
+        @self.tree.command(name="join", description="Join your current voice channel")
+        async def join_command(interaction: discord.Interaction) -> None:
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if member is None or member.voice is None or member.voice.channel is None:
+                await interaction.response.send_message(
+                    "You need to be in a voice channel first!",
+                    ephemeral=True,
+                )
                 return
-            
-            channel = ctx.author.voice.channel
-            await ctx.defer()
+
+            channel = member.voice.channel
+            await interaction.response.defer(thinking=True)
             success, message = await self.join_voice(channel)
-            await ctx.followup.send(message)
-        
-        @self.slash_command(name="leave", description="Leave the voice channel")
-        async def leave_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to leave voice channel."""
-            await ctx.defer()
-            success, message = await self.leave_voice(ctx.guild_id)
-            await ctx.followup.send(message)
-        
-        @self.slash_command(name="status", description="Check the bot's current status")
-        async def status_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to check bot status."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
+            await interaction.followup.send(message, ephemeral=not success)
+
+        @self.tree.command(name="leave", description="Leave the voice channel")
+        async def leave_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(thinking=True)
+            success, message = await self.leave_voice(interaction.guild_id)
+            await interaction.followup.send(message, ephemeral=not success)
+
+        @self.tree.command(name="status", description="Check the bot's current status")
+        async def status_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
+
             if not handler or handler.state == BotState.IDLE:
                 status = "Not connected to a voice channel."
             else:
@@ -82,90 +99,102 @@ class DiscordBot(commands.Bot):
                     BotState.SPEAKING: "Speaking response",
                 }
                 state_msg = state_messages.get(handler.state, "Unknown")
-                
-                # Add pause indicator if paused
+
                 if handler.state == BotState.SPEAKING and handler.is_response_paused:
-                    state_msg += " ⏸️ (paused)"
-                
+                    state_msg += " (paused)"
+
                 status = f"**Status:** {state_msg}"
-            
+
             embed = discord.Embed(
-                title="🎤 Voice Assistant Status",
+                title="Voice Assistant Status",
                 description=status,
                 color=discord.Color.blue(),
             )
             embed.add_field(name="Wake Phrase", value=f"`{self.config.wake_phrase_display}`", inline=True)
             embed.add_field(name="Voice", value=self.config.gemini_voice, inline=True)
-            
-            # Add queue info if connected
+            embed.add_field(name="Model", value=self.config.gemini_model, inline=True)
+            embed.add_field(
+                name="Features",
+                value=(
+                    f"Capture: {self.config.capture_duration}s • "
+                    f"Silence: {self.config.silence_threshold}s • "
+                    f"Buffer: {self.config.playback_buffer_ms}ms"
+                ),
+                inline=False,
+            )
+
             if handler and handler.state != BotState.IDLE:
                 queue_size = handler.get_queue_size()
                 embed.add_field(name="Queue", value=f"{queue_size} prompt(s)", inline=True)
-            
-            await ctx.respond(embed=embed)
-        
-        @self.slash_command(name="ask", description="Send a text prompt to the bot (no wake word needed)")
-        async def ask_command(
-            ctx: discord.ApplicationContext,
-            prompt: discord.Option(str, description="Your question or prompt for the AI", required=True),  # type: ignore
-        ) -> None:
-            """Slash command to send a text prompt directly to the bot."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
-            # Check if bot is connected to a voice channel
+
+            await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="ask", description="Send a text prompt to the bot (no wake word needed)")
+        @app_commands.describe(prompt="Your question or prompt for the AI")
+        async def ask_command(interaction: discord.Interaction, prompt: str) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
+
             if not handler or handler.state == BotState.IDLE:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not connected to a voice channel. Use `/join` first!",
                     ephemeral=True,
                 )
                 return
-            
-            # Check if bot is currently busy - queue the prompt instead of rejecting
+
             if handler.state in (BotState.PROCESSING, BotState.SPEAKING):
-                # Queue the prompt for later processing
-                position = handler.queue_text_prompt(prompt, ctx.author.id)
-                await ctx.respond(
-                    f"📋 I'm currently busy. Your prompt has been queued at **position #{position}**. "
-                    f"It will be processed automatically after the current request finishes.",
+                position = handler.queue_text_prompt(prompt, interaction.user.id)
+                if position == -1:
+                    await interaction.response.send_message(
+                        "The prompt queue is full. Please wait for some prompts to be processed first.",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.response.send_message(
+                    f"I'm currently busy. Your prompt has been queued at position #{position}. "
+                    "It will be processed automatically after the current request finishes.",
+                    ephemeral=True,
                 )
                 return
-            
-            # Check if bot is still connecting
+
             if handler.state == BotState.CONNECTING:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm still connecting to the voice channel. Please wait a moment.",
                     ephemeral=True,
                 )
                 return
-            
-            # Validate prompt
+
             prompt = prompt.strip()
             if not prompt:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Please provide a non-empty prompt.",
                     ephemeral=True,
                 )
                 return
-            
-            # Limit prompt length to avoid abuse
+
             max_prompt_length = 2000
             if len(prompt) > max_prompt_length:
-                await ctx.respond(
+                await interaction.response.send_message(
                     f"Prompt is too long. Maximum length is {max_prompt_length} characters.",
                     ephemeral=True,
                 )
                 return
-            
-            # Defer response since processing may take time
-            await ctx.defer()
-            
-            # Process the text prompt
+
+            await interaction.response.defer(thinking=True)
+
             try:
-                success = await handler.process_text_prompt(prompt, ctx.author.id)
+                success = await handler.process_text_prompt(prompt, interaction.user.id)
                 if success:
-                    await ctx.followup.send(f"🎤 Processing: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*")
+                    preview = prompt[:100] + ("..." if len(prompt) > 100 else "")
+                    await interaction.followup.send(f"Processing: \"{preview}\"")
                 else:
-                    await ctx.followup.send(
+                    await interaction.followup.send(
                         "Failed to process your prompt. Please try again.",
                         ephemeral=True,
                     )
@@ -175,151 +204,234 @@ class DiscordBot(commands.Bot):
                     "An error occurred while processing your request. Please try again.",
                     ephemeral=True,
                 )
-        
-        @self.slash_command(name="queue", description="View the current /ask prompt queue")
-        async def queue_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to view the current prompt queue."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
-            # Check if bot is connected
+
+        @self.tree.command(name="queue", description="View the current /ask prompt queue")
+        async def queue_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
             if not handler or handler.state == BotState.IDLE:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not connected to a voice channel.",
                     ephemeral=True,
                 )
                 return
-            
-            # Get queue items
+
             queue_items = handler.get_queue_items()
-            
             if not queue_items:
-                await ctx.respond(
-                    "📋 The prompt queue is empty.",
+                await interaction.response.send_message(
+                    "The prompt queue is empty.",
                     ephemeral=True,
                 )
                 return
-            
-            # Build queue display
+
             embed = discord.Embed(
-                title="📋 Prompt Queue",
+                title="Prompt Queue",
                 description=f"**{len(queue_items)}** prompt(s) waiting to be processed:",
                 color=discord.Color.blue(),
             )
-            
-            for i, (prompt, user_id) in enumerate(queue_items, 1):
-                # Truncate prompt for display
-                display_prompt = prompt[:80] + "..." if len(prompt) > 80 else prompt
+
+            max_items_to_show = 10
+            visible_items = queue_items[:max_items_to_show]
+            for i, (item_prompt, user_id) in enumerate(visible_items, 1):
+                display_prompt = item_prompt[:80] + "..." if len(item_prompt) > 80 else item_prompt
                 embed.add_field(
                     name=f"#{i}",
                     value=f"<@{user_id}>: *{display_prompt}*",
                     inline=False,
                 )
-            
-            await ctx.respond(embed=embed)
-        
-        @self.slash_command(name="stop", description="Stop the current request and move to the next in queue")
-        async def stop_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to stop the current request."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
+
+            hidden_items = len(queue_items) - len(visible_items)
+            if hidden_items > 0:
+                embed.set_footer(text=f"...and {hidden_items} more prompt(s) not shown.")
+
+            await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="stop", description="Stop the current request and move to the next in queue")
+        async def stop_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
             if not handler or handler.state == BotState.IDLE:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not connected to a voice channel.",
                     ephemeral=True,
                 )
                 return
-            
+
             if handler.state not in (BotState.PROCESSING, BotState.SPEAKING):
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not currently processing or speaking.",
                     ephemeral=True,
                 )
                 return
-            
+
             success = await handler.stop_response()
             if success:
                 queue_size = handler.get_queue_size()
                 if queue_size > 0:
-                    await ctx.respond(f"🛑 Request stopped. Processing next prompt in queue ({queue_size} remaining).")
+                    await interaction.response.send_message(
+                        f"Request stopped. Processing next prompt in queue ({queue_size} remaining)."
+                    )
                 else:
-                    await ctx.respond("🛑 Request stopped. Listening for wake word.")
+                    await interaction.response.send_message("Request stopped. Listening for wake word.")
             else:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Failed to stop the request.",
                     ephemeral=True,
                 )
-        
-        @self.slash_command(name="pause", description="Pause the bot's current response")
-        async def pause_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to pause the bot's response."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
+
+        @self.tree.command(name="pause", description="Pause the bot's current response")
+        async def pause_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
             if not handler or handler.state == BotState.IDLE:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not connected to a voice channel.",
                     ephemeral=True,
                 )
                 return
-            
+
             if handler.state != BotState.SPEAKING:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not currently speaking.",
                     ephemeral=True,
                 )
                 return
-            
+
             if handler.is_response_paused:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Response is already paused. Use `/continue` to resume.",
                     ephemeral=True,
                 )
                 return
-            
+
             success = handler.pause_response()
             if success:
-                await ctx.respond("⏸️ Response paused. Use `/continue` to resume.")
+                await interaction.response.send_message("Response paused. Use `/continue` to resume.")
             else:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Failed to pause the response.",
                     ephemeral=True,
                 )
-        
-        @self.slash_command(name="continue", description="Continue the bot's paused response")
-        async def continue_command(ctx: discord.ApplicationContext) -> None:
-            """Slash command to continue the bot's paused response."""
-            handler = self.get_voice_handler(ctx.guild_id)
-            
+
+        @self.tree.command(name="continue", description="Continue the bot's paused response")
+        async def continue_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
             if not handler or handler.state == BotState.IDLE:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not connected to a voice channel.",
                     ephemeral=True,
                 )
                 return
-            
+
             if handler.state != BotState.SPEAKING:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "I'm not currently speaking.",
                     ephemeral=True,
                 )
                 return
-            
+
             if not handler.is_response_paused:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Response is not paused.",
                     ephemeral=True,
                 )
                 return
-            
+
             success = handler.resume_response()
             if success:
-                await ctx.respond("▶️ Response resumed.")
+                await interaction.response.send_message("Response resumed.")
             else:
-                await ctx.respond(
+                await interaction.response.send_message(
                     "Failed to resume the response.",
                     ephemeral=True,
                 )
-        
-        logger.debug("Slash commands registered: /join, /leave, /status, /ask, /queue, /stop, /pause, /continue")
+
+        @self.tree.command(name="help", description="Show all available commands")
+        async def help_command(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(embed=self._build_help_embed(), ephemeral=True)
+
+        @self.tree.command(name="clearqueue", description="Clear all queued prompts")
+        async def clearqueue_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id is None:
+                await interaction.response.send_message(
+                    "This command can only be used in a server.",
+                    ephemeral=True,
+                )
+                return
+
+            handler = self.get_voice_handler(interaction.guild_id)
+            if not handler or handler.state == BotState.IDLE:
+                await interaction.response.send_message(
+                    "I'm not connected to a voice channel.",
+                    ephemeral=True,
+                )
+                return
+
+            removed = handler.clear_queue()
+            if removed == 0:
+                await interaction.response.send_message("The queue is already empty.", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Cleared **{removed}** prompt(s) from the queue.")
+
+        logger.debug(
+            "App commands registered: /join, /leave, /status, /ask, /queue, /stop, /pause, /continue, /help, /clearqueue"
+        )
+
+    def _build_help_embed(self) -> discord.Embed:
+        """Build a help embed listing all slash commands."""
+        embed = discord.Embed(
+            title="Voice Assistant - Commands",
+            description="Here are all available slash commands:",
+            color=discord.Color.green(),
+        )
+        cmds = [
+            ("/join", "Join your current voice channel."),
+            ("/leave", "Leave the voice channel."),
+            ("/status", "Show the bot's current state, model, and settings."),
+            ("/ask <prompt>", "Send a text prompt (queued if busy)."),
+            ("/queue", "View the current prompt queue."),
+            ("/clearqueue", "Clear all queued prompts."),
+            ("/stop", "Stop the current response and move on."),
+            ("/pause", "Pause the bot's spoken response."),
+            ("/continue", "Resume a paused response."),
+            ("/help", "Show this help message."),
+        ]
+        for name, desc in cmds:
+            embed.add_field(name=name, value=desc, inline=False)
+        return embed
+
+    async def setup_hook(self) -> None:
+        """Sync application commands after login, before ready."""
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} app command(s)")
+        except Exception as exc:
+            logger.error(f"Failed to sync app commands: {exc}")
     
     async def on_ready(self) -> None:
         """Handle bot ready event."""
@@ -336,7 +448,7 @@ class DiscordBot(commands.Bot):
         if self._config_watcher is None:
             self._config_watcher = ConfigWatcher(self.config, check_interval=2.0)
             await self._config_watcher.start()
-            logger.info("📝 Config file watcher started (changes auto-reload)")
+            logger.info("Config file watcher started (changes auto-reload)")
     
     async def on_voice_state_update(
         self,
@@ -352,7 +464,7 @@ class DiscordBot(commands.Bot):
             
             # Check if bot is in the same channel the user left from
             if handler and handler.is_connected:
-                if handler._voice_client and handler._voice_client.channel == before.channel:
+                if handler.is_connected_to_channel(before.channel):
                     logger.debug(f"User {member.name} ({member.id}) left voice channel, cleaning up resources")
                     handler.cleanup_user(member.id)
         
@@ -369,6 +481,11 @@ class DiscordBot(commands.Bot):
                     logger.debug(f"Ignoring disconnect during join process for guild {guild_id}")
                     return
                 
+                # Ignore disconnects during explicit leave command flow
+                if guild_id in self._leaving_guilds:
+                    logger.debug(f"Ignoring disconnect during leave process for guild {guild_id}")
+                    return
+                
                 # Check if we have a handler that's still connecting
                 if guild_id in self._voice_handlers:
                     handler = self._voice_handlers[guild_id]
@@ -379,15 +496,17 @@ class DiscordBot(commands.Bot):
                         return
                     
                     # Ignore if the voice client is still connected (spurious event)
-                    if handler._voice_client and handler._voice_client.is_connected():
+                    if handler.is_connected:
                         logger.debug(f"Ignoring spurious disconnect event - voice client still connected")
                         return
                 
                 # Real disconnection - clean up
                 logger.info(f"Bot disconnected from voice channel '{before.channel.name}' in guild {guild_id}")
                 if guild_id in self._voice_handlers:
-                    await self._voice_handlers[guild_id].leave_channel()
-                    del self._voice_handlers[guild_id]
+                    handler = self._voice_handlers.get(guild_id)
+                    if handler is not None:
+                        await handler.leave_channel()
+                    self._voice_handlers.pop(guild_id, None)
                     logger.debug(f"Voice handler removed for guild {guild_id}")
     
     def get_voice_handler(self, guild_id: int) -> Optional[VoiceHandler]:
@@ -462,13 +581,17 @@ class DiscordBot(commands.Bot):
         if guild_id not in self._voice_handlers:
             logger.debug("Not connected to any voice channel")
             return False, "Not connected to a voice channel."
-        
-        handler = self._voice_handlers[guild_id]
-        await handler.leave_channel()
-        del self._voice_handlers[guild_id]
-        logger.info(f"Left voice channel in guild {guild_id}")
-        
-        return True, "Left the voice channel. Goodbye!"
+
+        self._leaving_guilds.add(guild_id)
+        try:
+            handler = self._voice_handlers.get(guild_id)
+            if handler is not None:
+                await handler.leave_channel()
+            self._voice_handlers.pop(guild_id, None)
+            logger.info(f"Left voice channel in guild {guild_id}")
+            return True, "Left the voice channel. Goodbye!"
+        finally:
+            self._leaving_guilds.discard(guild_id)
     
     async def close(self) -> None:
         """Clean up resources when bot is closing."""
@@ -499,3 +622,4 @@ def set_bot(bot: DiscordBot) -> None:
     """Set the global bot reference."""
     global _bot
     _bot = bot
+

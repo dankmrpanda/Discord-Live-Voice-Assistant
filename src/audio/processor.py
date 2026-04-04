@@ -108,16 +108,23 @@ class AudioProcessor:
         """Convert numpy array to PCM bytes."""
         if sample_width == 2:
             dtype = np.int16
+            scale = 32768.0
+            min_val = -32768
             max_val = 32767
         elif sample_width == 4:
             dtype = np.int32
+            scale = 2147483648.0
+            min_val = -2147483648
             max_val = 2147483647
         else:
             dtype = np.int16
+            scale = 32768.0
+            min_val = -32768
             max_val = 32767
 
         audio_clipped = np.clip(audio, -1.0, 1.0)
-        audio_int = (audio_clipped * max_val).astype(dtype)
+        audio_scaled = np.rint(audio_clipped * scale).astype(np.int64)
+        audio_int = np.clip(audio_scaled, min_val, max_val).astype(dtype)
         return audio_int.tobytes()
 
     def resample(

@@ -1,6 +1,7 @@
 """Audio capture from Discord voice channels with per-user support."""
 
 import asyncio
+import time
 import threading
 from collections import deque
 from typing import Optional, Callable, Awaitable, Dict
@@ -224,7 +225,6 @@ class AudioCapture:
         if self._active_user_id is not None and user_id == self._active_user_id:
             # If streaming mode is active, push directly to queue (no concatenation!)
             if self._is_streaming_to_gemini:
-                import time
                 current_time = time.time()
                 
                 # Grace period: skip VAD processing during the wake word tail
@@ -278,49 +278,9 @@ class AudioCapture:
                         removed = self._buffer.popleft()
                         self._buffer_samples -= len(removed)
         
-        # Call callback with converted audio and user ID
+        # Call callback with converted audio, user ID, and raw Discord audio for debugging
         if self._audio_callback:
-            await self._audio_callback(gemini_pcm, user_id)
-    
-    async def process_discord_audio(
-        self,
-        pcm_data: bytes,
-        is_stereo: bool = True,
-    ) -> None:
-        """Process incoming audio from Discord.
-        
-        Converts Discord format (48kHz stereo) to Gemini format (16kHz mono)
-        and stores in buffer.
-        
-        Args:
-            pcm_data: Raw PCM audio from Discord.
-            is_stereo: Whether the audio is stereo.
-        """
-        if not self._is_capturing:
-            return
-        
-        # Convert to Gemini format
-        gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo)
-        audio = self.processor.pcm_to_numpy(gemini_pcm)
-        
-        async with self._lock:
-            # Add to buffer
-            self._buffer.append(audio)
-            self._buffer_samples += len(audio)
-            
-            # Trim buffer if too large
-            while self._buffer_samples > self._max_buffer_samples:
-                removed = self._buffer.popleft()
-                self._buffer_samples -= len(removed)
-        
-        # Call callback with converted audio (legacy - no user_id)
-        if self._audio_callback:
-            # Try to call with user_id=0 for backwards compatibility
-            try:
-                await self._audio_callback(gemini_pcm, 0)
-            except TypeError:
-                # Old callback signature without user_id
-                await self._audio_callback(gemini_pcm)
+            await self._audio_callback(gemini_pcm, user_id, pcm_data)
     
     async def get_recent_audio(self, duration: float, user_id: Optional[int] = None) -> bytes:
         """Get the most recent audio from the buffer.
@@ -500,7 +460,6 @@ class AudioCapture:
         Includes a grace period to skip the wake word tail audio and 
         minimum speech duration before silence detection kicks in.
         """
-        import time
         self._is_streaming_to_gemini = True
         self._consecutive_silent_frames = 0
         self._speech_detected = False
@@ -586,7 +545,6 @@ class AudioCapture:
             True if user stopped speaking (speech detected, then silence,
             and minimum speech duration requirement met).
         """
-        import time
         if not self._speech_detected:
             return False
         if self._consecutive_silent_frames < self._vad_silence_frames:

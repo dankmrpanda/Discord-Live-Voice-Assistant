@@ -1,11 +1,19 @@
 services:
-  discord-bot:
+  bot:
     build:
       context: ..
       dockerfile: docker/Dockerfile
       network: host
     container_name: discord-live-vc-bot
     restart: unless-stopped
+    # Match host user IDs so bind-mounted files (for example ./logs) are writable.
+    user: "${UID:-1000}:${GID:-1000}"
+
+    # IMPORTANT: host networking avoids Docker bridge/NAT iptables paths.
+    # This is the recommended mode on Alpine hosts where nftables/iptables
+    # interaction can break Discord voice connectivity.
+    network_mode: host
+
     env_file:
       - ../.env
     environment:
@@ -14,11 +22,10 @@ services:
     # THE FIX: Bypasses Docker's bridge network and Alpine's iptables firewall
     network_mode: "host"
     volumes:
-      # Mount source for development (optional, comment out in production)
-      - ../src:/app/src:ro
-      # Mount config file for easy editing
+      # Default workflow: run source code directly from host so src edits
+      # do not require image rebuilds.
+      - ../src:/app/src
       - ../config.yaml:/app/config.yaml:ro
-      # Mount logs directory
       - ../logs:/app/logs
     # No ports needed - bot connects outbound to Discord
     healthcheck:
