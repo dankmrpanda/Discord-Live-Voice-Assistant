@@ -42,6 +42,9 @@ class ConfigReloadTests(unittest.TestCase):
                         "behavior:",
                         "  capture_duration: 5.0",
                         "  silence_threshold: 0.5",
+                        "  gemini_first_chunk_timeout: 30.0",
+                        "  gemini_chunk_idle_timeout: 8.0",
+                        "  gemini_max_turn_duration: 90.0",
                         "logging:",
                         "  level: \"INFO\"",
                         "  directory: \"logs\"",
@@ -74,6 +77,9 @@ class ConfigReloadTests(unittest.TestCase):
                         "behavior:",
                         "  capture_duration: 7.0",
                         "  silence_threshold: 1.0",
+                        "  gemini_first_chunk_timeout: 12.0",
+                        "  gemini_chunk_idle_timeout: 4.0",
+                        "  gemini_max_turn_duration: 45.0",
                         "logging:",
                         "  level: \"DEBUG\"",
                         "  directory: \"custom_logs\"",
@@ -90,6 +96,9 @@ class ConfigReloadTests(unittest.TestCase):
             self.assertIn("gemini_voice", changed)
             self.assertIn("capture_duration", changed)
             self.assertIn("silence_threshold", changed)
+            self.assertIn("gemini_first_chunk_timeout", changed)
+            self.assertIn("gemini_chunk_idle_timeout", changed)
+            self.assertIn("gemini_max_turn_duration", changed)
             self.assertIn("log_level", changed)
             self.assertIn("log_audio", changed)
             self.assertGreaterEqual(len(notified), 1)

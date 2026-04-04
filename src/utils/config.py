@@ -43,6 +43,9 @@ class Config:
     # Bot Behavior
     capture_duration: float = 5.0
     silence_threshold: float = 0.5
+    gemini_first_chunk_timeout: float = 30.0
+    gemini_chunk_idle_timeout: float = 8.0
+    gemini_max_turn_duration: float = 90.0
     
     # System Prompt
     system_prompt: str = ""
@@ -128,7 +131,7 @@ class Config:
         # Get system prompt
         system_prompt = yaml_config.get("system_prompt", cls._default_system_prompt())
         
-        return cls(
+        config = cls(
             discord_bot_token=discord_token,
             discord_application_id=os.getenv("DISCORD_APPLICATION_ID"),
             gemini_api_key=gemini_key,
@@ -142,6 +145,9 @@ class Config:
             wake_word_threshold=float(wake_threshold),
             capture_duration=behavior_config.get("capture_duration", 5.0),
             silence_threshold=behavior_config.get("silence_threshold", 0.5),
+            gemini_first_chunk_timeout=behavior_config.get("gemini_first_chunk_timeout", 30.0),
+            gemini_chunk_idle_timeout=behavior_config.get("gemini_chunk_idle_timeout", 8.0),
+            gemini_max_turn_duration=behavior_config.get("gemini_max_turn_duration", 90.0),
             system_prompt=system_prompt,
             log_level=log_level,
             log_directory=logging_config.get("directory", "logs"),
@@ -187,6 +193,21 @@ class Config:
         # Silence threshold: must be positive
         if self.silence_threshold <= 0:
             raise ValueError(f"silence_threshold must be positive, got {self.silence_threshold}")
+
+        # Gemini timeouts: first chunk + idle timeout must be positive
+        if self.gemini_first_chunk_timeout <= 0:
+            raise ValueError(
+                f"gemini_first_chunk_timeout must be positive, got {self.gemini_first_chunk_timeout}"
+            )
+        if self.gemini_chunk_idle_timeout <= 0:
+            raise ValueError(
+                f"gemini_chunk_idle_timeout must be positive, got {self.gemini_chunk_idle_timeout}"
+            )
+        # Max turn duration can be 0 (disabled) or positive
+        if self.gemini_max_turn_duration < 0:
+            raise ValueError(
+                f"gemini_max_turn_duration must be >= 0, got {self.gemini_max_turn_duration}"
+            )
         
         # Playback buffer: must be non-negative
         if self.playback_buffer_ms < 0:
@@ -266,6 +287,9 @@ class Config:
         behavior_config = yaml_config.get("behavior", {})
         new_capture_duration = behavior_config.get("capture_duration", 5.0)
         new_silence_threshold = behavior_config.get("silence_threshold", 0.5)
+        new_first_chunk_timeout = behavior_config.get("gemini_first_chunk_timeout", 30.0)
+        new_chunk_idle_timeout = behavior_config.get("gemini_chunk_idle_timeout", 8.0)
+        new_max_turn_duration = behavior_config.get("gemini_max_turn_duration", 90.0)
         
         if self.capture_duration != new_capture_duration:
             changed_fields.append("capture_duration")
@@ -273,6 +297,15 @@ class Config:
         if self.silence_threshold != new_silence_threshold:
             changed_fields.append("silence_threshold")
             self.silence_threshold = new_silence_threshold
+        if self.gemini_first_chunk_timeout != new_first_chunk_timeout:
+            changed_fields.append("gemini_first_chunk_timeout")
+            self.gemini_first_chunk_timeout = float(new_first_chunk_timeout)
+        if self.gemini_chunk_idle_timeout != new_chunk_idle_timeout:
+            changed_fields.append("gemini_chunk_idle_timeout")
+            self.gemini_chunk_idle_timeout = float(new_chunk_idle_timeout)
+        if self.gemini_max_turn_duration != new_max_turn_duration:
+            changed_fields.append("gemini_max_turn_duration")
+            self.gemini_max_turn_duration = float(new_max_turn_duration)
         
         # System prompt
         new_system_prompt = yaml_config.get("system_prompt", self._default_system_prompt())
@@ -360,7 +393,6 @@ class Config:
             paths = [
                 Path("config.yaml"),
                 Path("config.yml"),
-                Path("/app/config.yaml"),  # Docker path
             ]
         
         for path in paths:

@@ -24,12 +24,6 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
-venv/
-ENV/
-env/
-.venv/
-
 # IDE
 .vscode/
 .idea/
@@ -43,9 +37,10 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
-
-# Docker
+logs/*
+!logs/.gitkeep
+openwakeword_models/*
+!openwakeword_models/.gitkeep
 docker-compose.override.yml
 
 # OpenWakeWord models (if custom)

@@ -1,31 +1,36 @@
 services:
-  discord-bot:
+  bot:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # Use host networking during build so apt/pip DNS follows host resolver.
+      # This avoids resolver issues seen on some Alpine VM Docker setups.
+      network: host
+    image: discord-live-vc-bot:latest
     container_name: discord-live-vc-bot
     restart: unless-stopped
+    # Match host user IDs so bind-mounted files (for example ./logs) are writable.
+    user: "${UID:-1000}:${GID:-1000}"
+
+    # IMPORTANT: host networking avoids Docker bridge/NAT iptables paths.
+    # This is the recommended mode on Alpine hosts where nftables/iptables
+    # interaction can break Discord voice connectivity.
+    network_mode: host
+
     env_file:
       - ../.env
     environment:
-      - PYTHONUNBUFFERED=1
-    volumes:
-      # Mount source for development (optional, comment out in production)
-      - ../src:/app/src:ro
-      # Mount config file for easy editing
-      - ../config.yaml:/app/config.yaml:ro
-      # Mount logs directory
-      - ../logs:/app/logs
-    networks:
-      - bot-network
-    # No ports needed - bot connects outbound to Discord
-    healthcheck:
-      test: ["CMD", "python", "-c", "import discord; print('healthy')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      # Ensure all runtime debug/audio dumps also land in the mounted logs dir.
+      LOG_DIR: /app/logs
+      # Store OpenWakeWord downloaded model assets in writable, persisted storage.
+      OWW_MODEL_DIR: /app/openwakeword_models
 
-networks:
-  bot-network:
-    driver: bridge
+    volumes:
+      # Default workflow: run source code directly from host so src edits
+      # do not require image rebuilds.
+      - ../src:/app/src
+      - ../config.yaml:/app/config.yaml:ro
+      - ../logs:/app/logs
+      - ../openwakeword_models:/app/openwakeword_models
+
+    command: ["python", "-m", "src.main"]

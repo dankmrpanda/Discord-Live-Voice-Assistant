@@ -51,9 +51,14 @@ def main() -> int:
     # Log library versions for debugging
     try:
         import discord
-        logger.info(f"py-cord version: {discord.__version__}")
+        logger.info(f"discord.py version: {discord.__version__}")
     except Exception:
-        logger.warning("Could not determine py-cord version")
+        logger.warning("Could not determine discord.py version")
+    try:
+        from discord.ext import voice_recv
+        logger.info(f"discord-ext-voice-recv version: {getattr(voice_recv, '__version__', 'unknown')}")
+    except Exception:
+        logger.warning("Could not determine discord-ext-voice-recv version")
     try:
         import openwakeword
         logger.info(f"openwakeword version: {openwakeword.__version__}")
@@ -89,7 +94,7 @@ def main() -> int:
     # Run the bot
     try:
         logger.info("Starting Discord bot connection...")
-        # py-cord doesn't use log_handler argument
+        # discord.py uses the default logging setup from our logger config
         bot.run(config.discord_bot_token)
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")

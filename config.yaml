@@ -94,6 +94,15 @@ behavior:
   # Higher = more tolerance for pauses mid-sentence
   silence_threshold: 1.0
 
+  # Gemini response timeout controls (seconds)
+  # First chunk timeout: maximum wait for Gemini to start speaking
+  gemini_first_chunk_timeout: 30.0
+  # Idle timeout: maximum silence gap between Gemini response chunks
+  gemini_chunk_idle_timeout: 8.0
+  # Max turn duration: hard cap for a single Gemini response turn
+  # Set to 0 to disable the max-turn guard.
+  gemini_max_turn_duration: 90.0
+
 # ------------------------------------------------------------
 # System Prompt
 # ------------------------------------------------------------

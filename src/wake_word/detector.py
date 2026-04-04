@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import os
+from pathlib import Path
 import threading
 import wave
 from typing import Optional, Callable, Awaitable, Dict, Tuple
@@ -94,6 +95,7 @@ class WakeWordDetector:
         
         # Model name for creating instances
         self._model_name = None
+        self._model_kwargs: dict = {}
         
         # === AGC (Automatic Gain Control) ===
         # Discord audio can be very loud (near full-scale). Other Discord users
@@ -135,7 +137,14 @@ class WakeWordDetector:
                 self.wake_phrase,
                 self.wake_phrase,  # Allow custom model paths
             )
-            
+
+            # Ensure model files exist in a writable cache directory and use
+            # explicit file paths (wheels may not include bundled model assets).
+            self._model_name, self._model_kwargs = self._prepare_model_assets(
+                openwakeword,
+                requested_model=self._model_name,
+            )
+
             logger.info(f"Loading wake word model: {self._model_name}")
             logger.debug(f"Available models: {list(AVAILABLE_MODELS.keys())}")
             
@@ -143,6 +152,7 @@ class WakeWordDetector:
             self._model = Model(
                 wakeword_models=[self._model_name],
                 inference_framework="onnx",
+                **self._model_kwargs,
             )
             
             # Log model file details
@@ -166,6 +176,99 @@ class WakeWordDetector:
             logger.error(f"Failed to load wake word model: {e}")
             logger.debug(f"Model load error details: {type(e).__name__}: {e}")
             raise
+
+    def _prepare_model_assets(self, openwakeword, requested_model: str) -> tuple[str, dict]:
+        """Ensure required ONNX model files exist and return model path + kwargs."""
+        model_cache_dir = Path(
+            os.environ.get("OWW_MODEL_DIR", os.path.join("models", "openwakeword"))
+        )
+        if not model_cache_dir.is_absolute():
+            model_cache_dir = (Path.cwd() / model_cache_dir).resolve()
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        from openwakeword import utils as oww_utils
+
+        # If user provided an explicit model file path, use it as-is.
+        requested_path = Path(requested_model)
+        if requested_path.exists():
+            logger.info(f"Using custom wake word model file: {requested_path}")
+            # Still ensure feature extractor models exist in cache.
+            self._ensure_feature_models(openwakeword, oww_utils, model_cache_dir)
+            return str(requested_path), self._feature_model_kwargs(model_cache_dir)
+
+        # Resolve requested built-in model from openwakeword metadata.
+        model_url = self._resolve_builtin_model_url(openwakeword, requested_model)
+        if model_url is None:
+            available = ", ".join(sorted(openwakeword.MODELS.keys()))
+            raise FileNotFoundError(
+                f"Wake word model '{requested_model}' not found and is not a valid file path. "
+                f"Available built-ins: {available}"
+            )
+
+        # Ensure shared feature extractor models.
+        self._ensure_feature_models(openwakeword, oww_utils, model_cache_dir)
+
+        # Ensure requested wake word model.
+        wake_tflite_name = model_url.split("/")[-1]
+        wake_onnx_name = wake_tflite_name.replace(".tflite", ".onnx")
+        wake_onnx_path = model_cache_dir / wake_onnx_name
+        if not wake_onnx_path.exists():
+            logger.info(f"Downloading wake word model assets to {model_cache_dir}")
+            oww_utils.download_file(model_url, str(model_cache_dir))
+            oww_utils.download_file(model_url.replace(".tflite", ".onnx"), str(model_cache_dir))
+
+        if not wake_onnx_path.exists():
+            raise FileNotFoundError(f"Downloaded wake model not found: {wake_onnx_path}")
+
+        logger.info(f"Wake word model path: {wake_onnx_path}")
+        return str(wake_onnx_path), self._feature_model_kwargs(model_cache_dir)
+
+    def _resolve_builtin_model_url(self, openwakeword, requested_model: str) -> Optional[str]:
+        """Resolve a built-in model URL from openwakeword.MODELS."""
+        # Direct key match first (e.g., "hey_jarvis")
+        if requested_model in openwakeword.MODELS:
+            return openwakeword.MODELS[requested_model]["download_url"]
+
+        # Then try matching by filename stem/version string (e.g., "hey_jarvis_v0.1")
+        for model_info in openwakeword.MODELS.values():
+            model_file = model_info["download_url"].split("/")[-1]
+            stem = model_file.replace(".tflite", "")
+            if requested_model == stem:
+                return model_info["download_url"]
+
+        # Fallback: if wake phrase was alias key in AVAILABLE_MODELS, map it.
+        alias_key = next((k for k, v in AVAILABLE_MODELS.items() if v == requested_model), None)
+        if alias_key and alias_key in openwakeword.MODELS:
+            return openwakeword.MODELS[alias_key]["download_url"]
+
+        return None
+
+    def _ensure_feature_models(self, openwakeword, oww_utils, model_cache_dir: Path) -> None:
+        """Ensure embedding/melspectrogram ONNX models exist in cache dir."""
+        required = ["melspectrogram.onnx", "embedding_model.onnx"]
+        missing = [name for name in required if not (model_cache_dir / name).exists()]
+        if not missing:
+            return
+
+        logger.info(f"Downloading OpenWakeWord feature models to {model_cache_dir}")
+        for feature_model in openwakeword.FEATURE_MODELS.values():
+            base_url = feature_model["download_url"]
+            oww_utils.download_file(base_url, str(model_cache_dir))
+            oww_utils.download_file(base_url.replace(".tflite", ".onnx"), str(model_cache_dir))
+
+    def _feature_model_kwargs(self, model_cache_dir: Path) -> dict:
+        """Build kwargs to point OpenWakeWord to local feature models."""
+        melspec_path = model_cache_dir / "melspectrogram.onnx"
+        embedding_path = model_cache_dir / "embedding_model.onnx"
+        if not melspec_path.exists() or not embedding_path.exists():
+            raise FileNotFoundError(
+                f"Required feature models missing in {model_cache_dir} "
+                f"(need melspectrogram.onnx and embedding_model.onnx)"
+            )
+        return {
+            "melspec_model_path": str(melspec_path),
+            "embedding_model_path": str(embedding_path),
+        }
     
     def _log_environment_info(self) -> None:
         """Log package versions and environment details for debugging."""
@@ -254,6 +357,7 @@ class WakeWordDetector:
                     model = Model(
                         wakeword_models=[self._model_name],
                         inference_framework="onnx",
+                        **self._model_kwargs,
                     )
                     self._prewarmed_models.append(model)
                 logger.info(f"Pre-warmed {models_to_create} models (total pool: {len(self._prewarmed_models)})")
@@ -434,7 +538,11 @@ class WakeWordDetector:
                 
                 logger.info(f"📼 Debug audio WAV saved: {wav_path} ({len(all_audio)} samples, {len(all_audio)/16000:.1f}s)")
                 logger.info(f"   RMS: {np.sqrt(np.mean(all_audio.astype(np.float32)**2)):.0f}, Peak: {np.max(np.abs(all_audio))}")
-                logger.info(f"   To test: python -c \"import openwakeword; m = openwakeword.Model(wakeword_models=['hey_jarvis_v0.1'], inference_framework='onnx'); print(max(p['hey_jarvis_v0.1'] for p in m.predict_clip('{wav_path}')))\"")
+                logger.info(
+                    f"   To test: python -c \"import openwakeword; "
+                    f"m = openwakeword.Model(wakeword_models=['{self._model_name}'], "
+                    f"inference_framework='onnx'); print(m.predict_clip('{wav_path}')[:3])\""
+                )
                 
                 # === CRITICAL DIAGNOSTIC: Run predict_clip on the saved WAV ===
                 # This compares streaming prediction (which yields 0.0000) against
@@ -444,6 +552,7 @@ class WakeWordDetector:
                     test_model = OWWModel(
                         wakeword_models=[self._model_name],
                         inference_framework="onnx",
+                        **self._model_kwargs,
                     )
                     clip_predictions = test_model.predict_clip(wav_path)
                     max_scores = {}
@@ -490,6 +599,7 @@ class WakeWordDetector:
                         test_model2 = OWWModel(
                             wakeword_models=[self._model_name],
                             inference_framework="onnx",
+                            **self._model_kwargs,
                         )
                         agc_predictions = test_model2.predict_clip(agc_wav_path)
                         agc_max_scores = {}
@@ -542,6 +652,7 @@ class WakeWordDetector:
                     self._user_models[user_id] = Model(
                         wakeword_models=[self._model_name],
                         inference_framework="onnx",
+                        **self._model_kwargs,
                     )
                     logger.info(f"Created wake word model for user {user_id}")
                 
@@ -679,7 +790,7 @@ class WakeWordDetector:
         # Small chunks are fine - they get buffered by the model. We only reject
         # near-empty chunks that would cause ONNX inference edge cases.
         # NOTE: Discord audio chunks vary in size (320-1280+ samples at 16kHz depending
-        # on py-cord version/decoder). Keep this low to avoid silently dropping valid audio.
+        # on Discord decoder behavior). Keep this low to avoid silently dropping valid audio.
         MIN_SAMPLES = 16
         if len(audio_np) < MIN_SAMPLES:
             logger.debug(f"Skipping audio chunk for user {user_id}: insufficient samples ({len(audio_np)}, need {MIN_SAMPLES})")

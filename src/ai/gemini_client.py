@@ -449,7 +449,7 @@ class GeminiLiveClient:
     # Sending data
     # --------------------------------------------------------------------- #
 
-    async def send_audio(self, audio_data: bytes) -> None:
+    async def send_audio(self, audio_data: bytes) -> bool:
         """Send audio data to Gemini.
 
         Args:
@@ -462,11 +462,11 @@ class GeminiLiveClient:
             logger.warning(
                 f"Cannot send audio: session={self._session is not None}, state={self._state}"
             )
-            return
+            return False
 
         if not audio_data:
             logger.debug("Skipping empty audio chunk")
-            return
+            return True
 
         # Ensure audio data has even number of bytes (16-bit PCM = 2 bytes/sample)
         if len(audio_data) % 2 != 0:
@@ -480,7 +480,7 @@ class GeminiLiveClient:
             logger.debug(
                 f"Skipping small audio chunk ({len(audio_data)} bytes < {self.MIN_AUDIO_CHUNK_SIZE})"
             )
-            return
+            return True
 
         try:
             from google.genai import types
@@ -501,19 +501,21 @@ class GeminiLiveClient:
             self._state = GeminiSessionState.STREAMING
             self._update_activity()  # Mark successful send
             logger.debug("Audio sent successfully")
+            return True
 
         except Exception as e:
             logger.error(f"Error sending audio: {e}")
             logger.debug(f"Send audio error details: {type(e).__name__}: {e}")
             self._record_error()  # Track send failure
+            return False
 
-    async def send_text(self, text: str) -> None:
+    async def send_text(self, text: str) -> bool:
         """Send a text turn to Gemini (text-in, audio-out)."""
         if not self._session or not self.is_connected:
             logger.warning(
                 f"Cannot send text: session={self._session is not None}, connected={self.is_connected}"
             )
-            return
+            return False
 
         try:
             from google.genai import types
@@ -529,12 +531,17 @@ class GeminiLiveClient:
                 turn_complete=True,
             )
             logger.debug("Text turn sent successfully")
+            self._state = GeminiSessionState.STREAMING
+            self._update_activity()
+            return True
 
         except Exception as e:
             logger.error(f"Error sending text: {e}")
             logger.debug(f"Send text error details: {type(e).__name__}: {e}")
+            self._record_error()
+            return False
 
-    async def end_turn(self) -> None:
+    async def end_turn(self) -> bool:
         """Signal end of audio input and request a response.
 
         For audio conversations, the recommended pattern is to send
@@ -545,15 +552,18 @@ class GeminiLiveClient:
             logger.warning(
                 f"Cannot end turn: session={self._session is not None}, connected={self.is_connected}"
             )
-            return
+            return False
 
         try:
             logger.debug("Sending audio_stream_end signal to Gemini")
             await self._session.send_realtime_input(audio_stream_end=True)
             logger.debug("audio_stream_end sent successfully")
+            return True
         except Exception as e:
             logger.error(f"Error ending turn: {e}")
             logger.debug(f"End turn error details: {type(e).__name__}: {e}")
+            self._record_error()
+            return False
 
     # --------------------------------------------------------------------- #
     # Receiving data
@@ -616,10 +626,15 @@ class GeminiLiveClient:
                         await self._text_callback(text)
 
                 # 2) Output audio transcription (if enabled in config)
-                if server_content and getattr(
-                    server_content, "output_audio_transcription", None
-                ):
-                    oat = server_content.output_audio_transcription
+                transcription = None
+                if server_content:
+                    transcription = getattr(server_content, "output_transcription", None)
+                    if transcription is None:
+                        # Backward-compat for older SDK field name.
+                        transcription = getattr(server_content, "output_audio_transcription", None)
+
+                if transcription:
+                    oat = transcription
                     # Shape is OutputAudioTranscription; keep this robust.
                     transcript_text = None
                     try:
@@ -641,9 +656,16 @@ class GeminiLiveClient:
                         if self._text_callback:
                             await self._text_callback(transcript_text)
 
+                # ---- Turn lifecycle debug flags ----
+                if server_content and getattr(server_content, "generation_complete", False):
+                    logger.debug("Gemini signaled generation_complete")
+                if server_content and getattr(server_content, "interrupted", False):
+                    logger.warning("Gemini turn was interrupted before completion")
+
                 # ---- Turn completion ----
                 if server_content and getattr(server_content, "turn_complete", False):
                     elapsed = time.time() - receive_start
+                    self._state = GeminiSessionState.CONNECTED
                     self._update_activity()  # Mark successful response completion
                     logger.info(
                         f"Gemini response complete: {chunk_count} chunks, "
@@ -703,8 +725,12 @@ class GeminiLiveClient:
                 if not ok:
                     return None
 
-            await self.send_audio(audio_data)
-            await self.end_turn()
+            sent = await self.send_audio(audio_data)
+            if not sent:
+                return None
+            ended = await self.end_turn()
+            if not ended:
+                return None
 
             return await self.get_full_audio_response()
 
