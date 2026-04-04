@@ -808,14 +808,20 @@ class VoiceHandler:
         ended_turn = False
         reason = "completed"
         max_duration = self.capture_duration
+        silence_threshold = float(getattr(self, "silence_threshold", 1.0))
 
-        # No-chunk timeout: if Discord stops sending frames, user has stopped speaking
-        no_chunk_timeout = 0.3
+        # No-chunk timeout: Discord may stop sending packets during short pauses.
+        # Use a more forgiving timeout derived from silence_threshold to avoid
+        # cutting off mid-request when users pause briefly.
+        no_chunk_timeout = max(0.8, min(silence_threshold, 1.5))
+        min_capture_before_no_chunk = 1.0
         last_chunk_time = time.time()
         received_at_least_one_chunk = False
 
         logger.debug(
-            f"Starting audio send loop (max {max_duration}s, no-chunk timeout {no_chunk_timeout}s, min speech 1.0s)"
+            "Starting audio send loop "
+            f"(max {max_duration}s, no-chunk timeout {no_chunk_timeout}s, "
+            f"min-capture-before-timeout {min_capture_before_no_chunk}s, min speech 1.0s)"
         )
 
         try:
@@ -836,7 +842,7 @@ class VoiceHandler:
                     break
 
                 # Check for no-chunk timeout (Discord stopped sending = user stopped talking)
-                if received_at_least_one_chunk:
+                if received_at_least_one_chunk and elapsed >= min_capture_before_no_chunk:
                     time_since_last_chunk = current_time - last_chunk_time
                     if time_since_last_chunk >= no_chunk_timeout:
                         logger.info(
