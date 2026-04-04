@@ -6,24 +6,8 @@ import platform
 from pathlib import Path
 
 from .utils.config import Config, ConfigWatcher
-from .utils.logger import setup_logger, get_logger, log_exception
+from .utils.logger import setup_logger, get_logger
 from .bot.client import DiscordBot, set_bot
-
-import discord
-import ctypes.util
-
-# Try finding the library via ctypes
-opus_lib = ctypes.util.find_library('opus')
-if opus_lib is None:
-    # Fallback to the exact file name installed by debian-slim's libopus0
-    opus_lib = 'libopus.so.0'
-
-if not discord.opus.is_loaded():
-    try:
-        discord.opus.load_opus(opus_lib)
-        print(f"Successfully loaded Opus from {opus_lib}")
-    except Exception as e:
-        print(f"Failed to load Opus: {e}")
 
 
 def main() -> int:
@@ -115,7 +99,8 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
     except Exception as e:
-        log_exception(logger, "Fatal error", e)
+        logger.error(f"Fatal error: {e}")
+        logger.debug(f"Fatal error details: {type(e).__name__}: {e}", exc_info=True)
         return 1
     
     logger.info("Bot shutdown complete")

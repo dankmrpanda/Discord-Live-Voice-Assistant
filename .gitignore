@@ -1,6 +1,7 @@
 # Environment variables
 .env
-.claude
+.claude/
+node_modules/
 # Python
 __pycache__/
 *.py[cod]
@@ -36,7 +37,11 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
+logs/*
+!logs/.gitkeep
+openwakeword_models/*
+!openwakeword_models/.gitkeep
+docker-compose.override.yml
 
 # OpenWakeWord models (if custom)
 *.onnx

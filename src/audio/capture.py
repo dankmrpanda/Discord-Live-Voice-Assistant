@@ -83,8 +83,7 @@ class AudioCapture:
         # Real-time streaming ring buffer for Gemini (low-latency path)
         # Uses deque with maxlen as a ring buffer - oldest frames are discarded when full
         # This prevents frame drops of NEW audio while still bounding memory usage
-        # 250 frames at 20ms each = 5 seconds of buffer headroom
-        self._streaming_buffer: deque[bytes] = deque(maxlen=250)
+        self._streaming_buffer: deque[bytes] = deque(maxlen=100)
         self._streaming_buffer_lock = asyncio.Lock()
         self._streaming_data_available = asyncio.Event()
         self._is_streaming_to_gemini = False
@@ -203,8 +202,8 @@ class AudioCapture:
         if not self._is_capturing:
             return
         
-        # Convert to Gemini format (16kHz mono) with per-user resampler state
-        gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo, user_id=user_id)
+        # Convert to Gemini format (16kHz mono)
+        gemini_pcm = self.processor.discord_to_gemini(pcm_data, is_stereo)
         audio = self.processor.pcm_to_numpy(gemini_pcm)
         
         # Get or create user's buffer
@@ -262,9 +261,6 @@ class AudioCapture:
                 
                 # Push frame directly to streaming ring buffer
                 # deque with maxlen automatically discards oldest if full
-                buf_len = len(self._streaming_buffer)
-                if buf_len >= self._streaming_buffer.maxlen * 0.8:
-                    logger.warning(f"Streaming buffer near capacity: {buf_len}/{self._streaming_buffer.maxlen}")
                 self._streaming_buffer.append(gemini_pcm)
                 self._streaming_data_available.set()
             else:
@@ -406,7 +402,7 @@ class AudioCapture:
     
     def cleanup_user(self, user_id: int) -> None:
         """Clean up resources for a user who left the channel.
-
+        
         Args:
             user_id: Discord user ID to clean up.
         """
@@ -417,14 +413,11 @@ class AudioCapture:
         with self._user_locks_lock:
             if user_id in self._user_locks:
                 del self._user_locks[user_id]
-
-        # Clean up per-user resampler filter state
-        self.processor.reset_user_state(user_id)
-
+        
         if self._active_user_id == user_id:
             self._active_user_id = None
             logger.info(f"Active user {user_id} left, cleared active user")
-
+        
         logger.debug(f"Cleaned up audio resources for user {user_id}")
     
     def get_active_users(self) -> list[int]:
