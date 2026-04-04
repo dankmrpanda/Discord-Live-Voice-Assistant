@@ -4,6 +4,8 @@ Just A Rather Very Intelligent System.
 
 A real-time AI voice assistant for Discord voice channels, powered by Gemini Live and OpenWakeWord.
 
+(We are so back)
+
 ## Features
 
 - Wake word activation (`hey_jarvis` by default) with OpenWakeWord
